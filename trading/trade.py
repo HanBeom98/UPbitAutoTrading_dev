@@ -5,9 +5,10 @@ import uuid
 import hashlib
 import os
 import numpy as np
-#from main import logger # 지정가 매매 할떄 주석 해제
 from urllib.parse import urlencode, unquote
 from dotenv import load_dotenv
+from datetime import datetime
+from typing import Optional
 
 
 # ✅ 환경 변수 로드
@@ -190,19 +191,20 @@ def cancel_old_orders(market: str, max_wait_time=30):
         created_at = order["created_at"]
 
         try:
-            order_timestamp = time.mktime(time.strptime(created_at, "%Y-%m-%dT%H:%M:%S.%f"))  # ✅ 밀리초까지 처리
+            # datetime 객체로 파싱 후, 시간대 정보 제거
+            order_timestamp = datetime.fromisoformat(created_at.replace("+09:00", "")).timestamp()
         except ValueError:
-            order_timestamp = time.mktime(time.strptime(created_at, "%Y-%m-%dT%H:%M:%S"))  # ✅ 밀리초 없는 경우
+            print(f"🚨 {market} 주문 생성 시간 형식 오류: {created_at}")
+            continue
 
         if current_time - order_timestamp > max_wait_time:
-
             cancel_result = cancel_order(order_uuid)
 
-            # ✅ 주문 취소 결과 로그 추가
-            if cancel_result.get("state") == "cancel":
-                logger.info(f"✅ {market} 미체결 주문 취소 완료 - 주문 UUID: {order_uuid}")
-            else:
-                logger.warning(f"⚠️ {market} 미체결 주문 취소 실패 - 주문 UUID: {order_uuid}")
+        # ✅ 주문 취소 결과 로그 추가
+        if cancel_result.get("state") == "cancel":
+            print(f"✅ {market} 미체결 주문 취소 완료 - 주문 UUID: {order_uuid}")
+        else:
+            print(f"⚠️ {market} 미체결 주문 취소 실패 - 주문 UUID: {order_uuid}")
 
 
 def cancel_order(order_uuid):
