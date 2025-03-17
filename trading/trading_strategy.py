@@ -21,6 +21,9 @@ trading_context = TradingContext()  # 공유 인스턴스
 def trading_strategy(df: pd.DataFrame, position: int, ticker: str, buy_price: Optional[float] = None, fee_rate: float = 0.0005, trailing_stop_pct: float = 0.02) -> dict:
     """📌 코인 시장 맞춤 단타 트레이딩 전략"""
 
+    # 🔹 매매 전략 실행 로그
+    logger.info(f"📊 {ticker} 매매 전략 시작 - 보유 여부: {position}, 현재가: {df['close'].iloc[-1]}, 매수가: {buy_price}")
+
     if df is None or df.empty or len(df) < 200 or df.isnull().sum().sum() > 0:
         logger.warning(f"⚠️ {ticker} 데이터 부족 또는 NaN 포함 (최소 200개 필요)")
         return {"signal": "", "message": "데이터 부족 또는 NaN 포함"}
@@ -60,6 +63,7 @@ def trading_strategy(df: pd.DataFrame, position: int, ticker: str, buy_price: Op
     # 📌 **손절 3번 이상이면 30분 동안 매수 금지**
     if trading_context.consecutive_losses >= 3 and trading_context.last_sell_time:
         time_since_last_sell = datetime.now() - trading_context.last_sell_time
+        logger.warning(f"⛔ {ticker} 손절 {trading_context.consecutive_losses}번 → 매수 제한 (남은 시간: {30 - time_since_last_sell.seconds // 60}분)")
         if time_since_last_sell < timedelta(minutes=30):  # 🔥 **손절 후 30분 제한**
             logger.warning(f"⛔ {ticker} 최근 손절 {trading_context.consecutive_losses}번 → 30분 동안 매수 금지 (남은 시간: {30 - time_since_last_sell.seconds // 60}분)")
             return {"signal": "", "message": "손절 3번 초과 → 30분 동안 매수 금지"}
@@ -68,6 +72,7 @@ def trading_strategy(df: pd.DataFrame, position: int, ticker: str, buy_price: Op
 
     # 📌 매수 조건
     if position == 0:
+        logger.info(f"📊 {ticker} 매수 조건 평가 - EMA5: {df['EMA5'].iloc[-1]}, EMA15: {df['EMA15'].iloc[-1]}, MACD: {macd_histogram}, MACD_LONG: {macd_long_histogram}, RSI: {rsi_value}, Stoch_K: {stoch_k}, Stoch_D: {stoch_d}, 볼밴 하단: {bb_lower}, 거래량 급증 여부: {volume_spike}")
 
         # ✅ 손절 횟수에 따라 투자 비율을 점진적으로 줄이기
         investment_ratio = max(0.1, 1.0 - (trading_context.consecutive_losses * 0.1))
@@ -86,17 +91,17 @@ def trading_strategy(df: pd.DataFrame, position: int, ticker: str, buy_price: Op
                 return {"signal": "", "message": "연속 손절 7번 초과 → 거래량 급증 필요"}
 
         if is_bullish and latest_close > df['EMA5'].iloc[-1] and macd_histogram > 0 and macd_long_histogram > 0 and volume_spike and stoch_k > stoch_d and rsi_value > 50:
-            logger.info(f"📈 {ticker} 상승장 매수 신호 발생")
+            logger.info(f"✅ {ticker} 상승장 매수 조건 충족: {is_bullish}, {latest_close}, {df['EMA5'].iloc[-1]}, {macd_histogram}, {macd_long_histogram}, {volume_spike}, {stoch_k}, {stoch_d}, {rsi_value}")
             trading_context.last_buy_time = datetime.now()
             return {"signal": "buy", "message": "상승장 매수"}
 
         if is_bearish and rsi_value < 30 and latest_close > recent_low and stoch_k < 20:
-            logger.info(f"📈 {ticker} 하락장 반등 매수 신호 발생")
+            logger.info(f"✅ {ticker} 하락장 반등 매수 신호 트리거 - RSI: {rsi_value}, 최저가: {recent_low}, Stoch_K: {stoch_k}")
             trading_context.last_buy_time = datetime.now()
             return {"signal": "buy", "message": "하락장 반등 매수"}
 
         if latest_close <= bb_lower and rsi_value < 35:
-            logger.info(f"📈 {ticker} 볼린저 밴드 하단 반등 매수")
+            logger.info(f"✅ {ticker} 볼린저 밴드 하단 반등 매수 - 현재가: {latest_close}, 볼밴 하단: {bb_lower}, RSI: {rsi_value}")
             trading_context.last_buy_time = datetime.now()
             return {"signal": "buy", "message": "볼린저 밴드 하단 반등 매수"}
 
