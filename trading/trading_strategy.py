@@ -1,314 +1,134 @@
-# import math
 import pandas as pd
+import numpy as np
+import logging
+from datetime import datetime, timedelta
 from typing import Optional
-from ta.trend import MACD
+from ta.trend import MACD, EMAIndicator
 from ta.momentum import RSIIndicator
-from ta.volatility import BollingerBands
+from ta.volatility import BollingerBands, AverageTrueRange
+from ta.momentum import StochasticOscillator
 
+logger = logging.getLogger(__name__)
 
-def trading_strategy(
-        df: pd.DataFrame,
-        position: int,
-        buy_time: Optional[str] = None,
-        buy_price: Optional[float] = None
-) -> dict:
-    """
-    코인 트레이딩 전략 함수 - 시장 상황(상승장/하락장)에 따른 차별화된 전략 적용
+class TradingContext:
+    def __init__(self):
+        self.last_sell_time = None  # 마지막 매도 시간
+        self.consecutive_losses = 0  # 연속 손절 횟수
+        self.last_buy_time = None  # 마지막 매수 시간
 
-    Args:
-        df (pd.DataFrame): 가격 데이터프레임
-        position (int): 현재 포지션 (0: 매수 가능, 1: 매도 가능)
-        buy_time (str, optional): 매수 시간
-        buy_price (float, optional): 매수 가격
+trading_context = TradingContext()  # 공유 인스턴스
 
-    Returns:
-        str: 트레이딩 액션 ('buy', 'sell', '')
+def trading_strategy(df: pd.DataFrame, position: int, ticker: str, buy_price: Optional[float] = None, fee_rate: float = 0.0005, trailing_stop_pct: float = 0.02) -> dict:
+    """📌 코인 시장 맞춤 단타 트레이딩 전략"""
 
-    ===============================================================================================
-    # 매수/매도 플랜 설명
-    - 50MA, 200MA로 시장 상황 판단 (특히 데드 크로스)
-    - 분할 매수/매도 하지 않고, 전 금액(KRW)로 매수하고 매도 시에도 한번에 전체를 매도합니다.
-    - 매수는 3분 간격으로 판단 (단, 매도는 매분 타이밍을 확인합니다.)
-    - RSI, MACD, 볼린저밴드, 거래량 지표를 활용
-    - 손절매 조건 (1% 손실)
+    if df is None or df.empty or len(df) < 200 or df.isnull().sum().sum() > 0:
+        logger.warning(f"⚠️ {ticker} 데이터 부족 또는 NaN 포함 (최소 200개 필요)")
+        return {"signal": "", "message": "데이터 부족 또는 NaN 포함"}
 
-    ## 매매 전략
-    - 매수는 이전 캔들이 볼린저밴드 하단 아래로 내려가고 최종 캔들이 양봉인 경우 진행
-      (단, 데드 크로스가 발생한 이후에 50MA 기울기가 양수로 한번이라도 전환되기 전까지는 매수 금지)
-    - 매도는 RSI가 한번이라도 72을 넘어서고, MACD가 하향 교차되는 경우 진행
-    - 단 매수 시점 이후에 한 번이라도 볼린저밴드의 상단을 돌파하는 경우라면, 볼린저밴드의 중심 아래로 떨어지면 즉시 매도
-
-    ## 아래 전략은 폐기. 나중에 써먹는 걸로..
-    #- 매수는 RSI가 25 이하로 쌍바닥이 나오고 MACD 히스토그램이 양전환. 상승장과 다르게 최근 100번의 데이터를 확인
-    #  (50MA 기울기가 양수로 한번이라도 전환되기 전까지는 매수 금지)
-    #- 매도는 이전 캔들(종가 기준)이 볼린저밴드 상단을 돌파하고 거래량이 20일 이동평균을 초과하는 경우
-
-    # 계산에 사용될 df 설명
-    - close: 종가
-    - open: 시가
-    - high: 고가
-    - low: 저가
-    - volume: 거래량
-    """
-
-    # DataFrame 필수 데이터 검증
-    required_columns = ['close', 'date', 'time', 'volume']
-    if not all(col in df.columns for col in required_columns):
-        raise ValueError(f"DataFrame은 {required_columns} 컬럼을 포함해야 합니다.")
-
-    # 최소 200개 데이터 필요 (MA200 계산을 위해)
-    if len(df) < 200:
-        print('데이터가 부족합니다 (최소 200개 필요).')
-        return {
-            "signal": "",
-            "message": ""
-        }
-
-    # 이동평균선 계산
-    df['MA20'] = df['close'].rolling(window=20).mean()
-    # df['MA50'] = df['close'].rolling(window=50).mean()
-    df['MA200'] = df['close'].rolling(window=200).mean()
-
-    # 20MA 기울기 계산
-    df['MA20_slope'] = df['MA20'].diff()  # diff() 함수를 사용하여 기울기 계산
-
-    # # 골든 크로스 / 데드 크로스 확인
-    # golden_cross = (df['MA50'].iloc[-2] < df['MA200'].iloc[-2]) and (df['MA50'].iloc[-1] > df['MA200'].iloc[-1])
-    # dead_cross = (df['MA50'].iloc[-2] > df['MA200'].iloc[-2]) and (df['MA50'].iloc[-1] < df['MA200'].iloc[-1])
-
-    # 시장 상황 판단 (20MA와 200MA 비교)
-    is_bull_market = df['MA20'].iloc[-1] > df['MA200'].iloc[-1]
-
-    print(f'is_bull_market : {is_bull_market}')
-
-    # RSI 계산
-    rsi_indicator = RSIIndicator(df['close'], window=14)
-    df['RSI'] = rsi_indicator.rsi()
+    df = df.copy().ffill().dropna()
 
     # MACD 계산
-    macd = MACD(df['close'])
-    df['MACD'] = macd.macd()
-    df['MACD_signal'] = macd.macd_signal()
-    df['MACD_histogram'] = macd.macd_diff()
+    macd = MACD(df['close'], window_slow=12, window_fast=26, window_sign=9)
+    macd_histogram = macd.macd_diff().fillna(0).iloc[-1]
 
-    # 볼린저밴드 계산
-    bollinger = BollingerBands(df['close'])
-    df['BB_upper'] = bollinger.bollinger_hband()
-    df['BB_mid'] = bollinger.bollinger_mavg()
-    df['BB_lower'] = bollinger.bollinger_lband()
+    macd_long = MACD(df['close'], window_slow=50, window_fast=200, window_sign=9)
+    macd_long_histogram = macd_long.macd_diff().fillna(0).iloc[-1]
 
-    # 매수 가능
+    rsi = RSIIndicator(df['close'], window=14).rsi()
+    rsi_value = rsi.fillna(50).iloc[-1]
+
+    bb_indicator = BollingerBands(df['close'], window=20)
+    bb_lower = bb_indicator.bollinger_lband().fillna(df['close']).iloc[-1]
+
+    atr = AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range().iloc[-1]
+
+    df['EMA5'] = EMAIndicator(df['close'], window=5).ema_indicator().fillna(df['close'])
+    df['EMA15'] = EMAIndicator(df['close'], window=15).ema_indicator().fillna(df['close'])
+
+    latest_close = df['close'].iloc[-1]
+    recent_low = df['close'].rolling(window=10).min().iloc[-1]
+
+    volume_spike = df['volume'].iloc[-1] > df['volume'].rolling(5).mean().iloc[-1] * 1.3  # 최근 5일 평균보다 30% 이상 증가
+
+    is_bullish = df['EMA5'].iloc[-1] > df['EMA15'].iloc[-1]
+    is_bearish = df['EMA5'].iloc[-1] < df['EMA15'].iloc[-1]
+
+    stoch = StochasticOscillator(df['high'], df['low'], df['close'], window=14, smooth_window=3)
+    stoch_k = stoch.stoch().iloc[-1]
+    stoch_d = stoch.stoch_signal().iloc[-1]
+
+    # 📌 **손절 3번 이상이면 30분 동안 매수 금지**
+    if trading_context.consecutive_losses >= 3 and trading_context.last_sell_time:
+        time_since_last_sell = datetime.now() - trading_context.last_sell_time
+        if time_since_last_sell < timedelta(minutes=30):  # 🔥 **손절 후 30분 제한**
+            logger.warning(f"⛔ {ticker} 최근 손절 {trading_context.consecutive_losses}번 → 30분 동안 매수 금지 (남은 시간: {30 - time_since_last_sell.seconds // 60}분)")
+            return {"signal": "", "message": "손절 3번 초과 → 30분 동안 매수 금지"}
+    else:
+        trading_context.consecutive_losses = 0  # 🔥 30분이 지나면 손절 횟수 초기화
+
+    # 📌 매수 조건
     if position == 0:
-        buy_condition = False
-        buy_msg = ''
 
-        # 20일 거래량 이동평균 계산 추가
-        df['Volume_MA20'] = df['volume'].rolling(window=20).mean()
+        # ✅ 손절 횟수에 따라 투자 비율을 점진적으로 줄이기
+        investment_ratio = max(0.1, 1.0 - (trading_context.consecutive_losses * 0.1))
+        logger.info(f"📉 {ticker} 투자 비율 조정: {investment_ratio * 100:.1f}% (손절 횟수: {trading_context.consecutive_losses})")
 
-        # 최근 20개의 DataFrame 추출
-        recent_df: pd.DataFrame = df.tail(20)
+        # ✅ 손절 5번 이상이면 RSI 30 이하 & MACD 골든크로스가 발생해야만 매수 가능
+        if trading_context.consecutive_losses >= 5:
+            if rsi_value >= 30 or macd_histogram <= 0:
+                logger.warning(f"⛔ {ticker} 연속 손절 {trading_context.consecutive_losses}번 → RSI 30 이하 & MACD 골든크로스 필요 (현재 RSI: {rsi_value:.2f}, MACD: {macd_histogram:.2f})")
+                return {"signal": "", "message": "연속 손절 5번 초과 → RSI 30 이하 & MACD 골든크로스 필요"}
 
-        if not is_bull_market:
-            # recent_df_10: pd.DataFrame = df.tail(10)
-            #
-            # # 해당 구간에서 20MA 기울기가 0보다 큰 적이 있는지 확인
-            # ma20_slope_positive = (recent_df_10['MA20_slope'] > 0).any()
-            #
-            # if not ma20_slope_positive:
+        # ✅ 손절 7번 이상이면 거래량 급증도 필요
+        if trading_context.consecutive_losses >= 7:
+            if not volume_spike:
+                logger.warning(f"⛔ {ticker} 연속 손절 {trading_context.consecutive_losses}번 → 추가적으로 거래량 급증 필요")
+                return {"signal": "", "message": "연속 손절 7번 초과 → 거래량 급증 필요"}
 
-            # 추가 매수 조건: RSI 30 미만 이후 MACD 히스토그램 양전환
-            rsi_under_30 = (recent_df['RSI'] < 30).any()
+        if is_bullish and latest_close > df['EMA5'].iloc[-1] and macd_histogram > 0 and macd_long_histogram > 0 and volume_spike and stoch_k > stoch_d and rsi_value > 50:
+            logger.info(f"📈 {ticker} 상승장 매수 신호 발생")
+            trading_context.last_buy_time = datetime.now()
+            return {"signal": "buy", "message": "상승장 매수"}
 
-            # MACD 히스토그램 양전환 확인
-            macd_turned_positive = (
-                    recent_df['MACD_histogram'].iloc[-1] > recent_df['MACD_histogram'].iloc[-2] and
-                    (recent_df['MACD_histogram'].iloc[-1] > 0 > recent_df['MACD_histogram'].iloc[-2] or
-                     recent_df['MACD_histogram'].iloc[-1] > 0 > recent_df['MACD_histogram'].iloc[-3])
-            )
+        if is_bearish and rsi_value < 30 and latest_close > recent_low and stoch_k < 20:
+            logger.info(f"📈 {ticker} 하락장 반등 매수 신호 발생")
+            trading_context.last_buy_time = datetime.now()
+            return {"signal": "buy", "message": "하락장 반등 매수"}
 
-            print(f'rsi_under_30 : {rsi_under_30}')
-            print(f'macd_turned_positive : {macd_turned_positive}')
+        if latest_close <= bb_lower and rsi_value < 35:
+            logger.info(f"📈 {ticker} 볼린저 밴드 하단 반등 매수")
+            trading_context.last_buy_time = datetime.now()
+            return {"signal": "buy", "message": "볼린저 밴드 하단 반등 매수"}
 
-            if rsi_under_30 and macd_turned_positive:
-                buy_condition = True
-                buy_msg = 'RSI 30 미만 이후 MACD 히스토그램 양전환'
-            # else:
-            #     print('데드 크로스 발생 후 20MA 기울기가 양수로 한번이라도 전환되기 전까지 매수 대기')
-            #     return {
-            #         "signal": "",
-            #         "message": ""
-            #     }
-        else:
-            # 시작(open)값이 20MA 아래이고, 종료(close) 값이 20MA를 돌파
-            is_20ma_up = (
-                    recent_df['open'].iloc[-1] < recent_df['MA20'].iloc[-1] < recent_df['close'].iloc[-1]
-            )
+        # 연속 손절 후 RSI 25 이하 & MACD 상승 골든크로스 시 강제 매수
+        if trading_context.consecutive_losses >= 3 and rsi_value < 25 and macd_histogram > 0:
+            logger.info(f"🔥 {ticker} RSI 과매도 + MACD 골든크로스 → 강제 매수")
+            trading_context.last_buy_time = datetime.now()
+            return {"signal": "buy", "message": "RSI 과매도 + MACD 반등 강제 매수"}
 
-            if is_20ma_up:
-                buy_condition = True
-                buy_msg = '시작(open)값이 20MA 보다 작고 종료(close) 값이 20MA를 돌파'
+    # 📌 매도 조건
+    if position == 1 and buy_price is not None:
+        buy_price = float(buy_price)
 
-        # if not buy_condition:
-        #     # 이전 캔들이 볼린저밴드 하단 아래로 내려갔는지 확인
-        #     prev_candle_below_bb = recent_df['close'].iloc[-2] <= recent_df['BB_lower'].iloc[-2]
-        #
-        #     # 최종 캔들이 양봉인지 확인
-        #     current_candle_is_positive = recent_df['close'].iloc[-1] >= recent_df['open'].iloc[-1]
-        #
-        #     buy_condition = prev_candle_below_bb and current_candle_is_positive
-        #     buy_msg = '이전 캔들이 볼린저밴드 하단 아래이고 최종 캔들이 양봉'
+        # ✅ 트레일링 스탑 (내 매수가 기준)
+        trailing_stop = buy_price * (1 - trailing_stop_pct)
+        stop_loss = max(trailing_stop, buy_price * 0.98) * (1 - fee_rate)
+        take_profit = min(buy_price * 1.03, buy_price + (atr * 2))
 
-        if not buy_condition:
-            # 다음 조건인 경우에도 매수하도록 설정
-            # 거래량이 20일 이동평균 초과
-            is_20ma_volume_up = recent_df['volume'].iloc[-1] > recent_df['Volume_MA20'].iloc[-1]
+        # ✅ 실질 손익 계산
+        net_profit = (latest_close * (1 - fee_rate)) - (buy_price * (1 + fee_rate))
 
-            # 시작(open)값이 볼린저밴드 중간 아래이고, 종료(close) 값이 볼린저밴드 상단을 돌파
-            is_giant_bb_up = (
-                    recent_df['open'].iloc[-1] <= recent_df['BB_mid'].iloc[-1] and
-                    recent_df['close'].iloc[-1] >= recent_df['BB_upper'].iloc[-1]
-            )
+        # ✅ 손절 실행
+        if latest_close < stop_loss:
+            trading_context.consecutive_losses += 1
+            trading_context.last_sell_time = datetime.now()
+            logger.info(f"❌ {ticker} 손절 실행 (손절가: {stop_loss:.2f}원, 실제 손익: {net_profit:.2f}원)")
+            return {"signal": "sell", "message": f"손절 실행 (손절가: {stop_loss:.2f}원, 실제 손익: {net_profit:.2f}원)"}
 
-            if is_20ma_volume_up and is_giant_bb_up:
-                buy_condition = True
-                buy_msg = '거래량이 20MA를 초과하고, 캔들이 볼린저밴드 중간 아래에서 상단까지 돌파한 장대 양봉입니다.'
+        # ✅ 익절 실행
+        if latest_close >= take_profit and net_profit > 0:
+            trading_context.consecutive_losses = max(0, trading_context.consecutive_losses - 2)
+            logger.info(f"✅ {ticker} 익절 발생 → 손절 횟수 2단계 감소 (현재 손절 횟수: {trading_context.consecutive_losses})")
+            return {"signal": "sell", "message": f"익절 실행 (손절 횟수: {trading_context.consecutive_losses})"}
 
-        # else:
-        #     # 하락장 매수 조건
-        #     recent_df_100: pd.DataFrame = df.tail(100)
-        #     rsi_series = recent_df_100['RSI']
-        #     rsi_valleys = []
-        #
-        #     # RSI 저점 찾기
-        #     for i in range(1, len(rsi_series) - 1):
-        #         if (rsi_series.iloc[i] <= 25 and
-        #                 rsi_series.iloc[i] < rsi_series.iloc[i - 1] and
-        #                 rsi_series.iloc[i] < rsi_series.iloc[i + 1]):
-        #             rsi_valleys.append(i)
-        #
-        #     # RSI 쌍바닥 확인
-        #     has_double_bottom = len(rsi_valleys) >= 2
-        #
-        #     # MACD 히스토그램 양전환 확인
-        #     macd_turned_positive = (
-        #             recent_df_100['MACD_histogram'].iloc[-1] > recent_df_100['MACD_histogram'].iloc[-2] and
-        #             (recent_df_100['MACD_histogram'].iloc[-1] > 0 > recent_df_100['MACD_histogram'].iloc[-2] or
-        #              recent_df_100['MACD_histogram'].iloc[-1] > 0 > recent_df_100['MACD_histogram'].iloc[-3])
-        #     )
-        #
-        #     print(f'len(rsi_valleys) : {len(rsi_valleys)}')
-        #     print(f'has_double_bottom : {has_double_bottom}')
-        #     print(f'macd_turned_positive : {macd_turned_positive}')
-        #
-        #     buy_condition = has_double_bottom and macd_turned_positive
-
-        if buy_condition:
-            print(f'buy_signal! - {buy_msg}')
-            return {
-                "signal": "buy",
-                "message": f"매수 조건에 부합 - {buy_msg}"
-            }
-
-    # 매도 가능
-    elif position == 1:
-        # 필수 입력값 검증
-        if not buy_time or not buy_price:
-            print('매수 시간 또는 가격 정보가 없습니다.')
-            return {
-                "signal": "",
-                "message": ""
-            }
-
-        # 손절매 조건 (0.69% 손실)
-        current_price = df['close'].iloc[-1]
-        if current_price < buy_price * 0.9931:
-            print('sell_signal - 손절매!!')
-            return {
-                "signal": "sell",
-                "message": "손절매!!"
-            }
-
-        # # 20일 거래량 이동평균 계산 추가
-        # df['Volume_MA20'] = df['volume'].rolling(window=20).mean()
-
-        # 'datetime' 데이터 만들기
-        df['datetime'] = pd.to_datetime(df['date'] + ' ' + df['time'])
-        buy_datetime = pd.to_datetime(buy_time)
-
-        after_buy_df = df[df['datetime'] > buy_datetime]
-
-        print(f'len(after_buy_df) : {len(after_buy_df)}')
-
-        # 최소 2개의 캔들이 있어야 인덱싱 가능
-        if len(after_buy_df) >= 2:
-            if is_bull_market:
-                # 매수 후 볼린저밴드 상단 돌파 여부 확인
-                has_breached_upper_band = (after_buy_df['close'] > after_buy_df['BB_upper']).any()
-
-                # 한번이라도 볼린저밴드 상단을 돌파한 경우, 중심선 아래로 하락 시 매도
-                if has_breached_upper_band:
-                    if after_buy_df['close'].iloc[-1] < after_buy_df['BB_mid'].iloc[-1]:
-                        print('sell_signal - 볼린저밴드 상단 돌파 후 중심선 아래로 하락')
-                        return {
-                            "signal": "sell",
-                            "message": "볼린저밴드 상단 돌파 후 중심선 아래로 하락"
-                        }
-
-                # # 상승장 매도 조건: RSI 72 초과 후 MACD 하향 교차
-                # rsi_above_72 = (after_buy_df['RSI'] > 72).any()
-                #
-                # # MACD 하향 교차 검증
-                # macd_cross_down = (
-                #         after_buy_df['MACD'].iloc[-1] < after_buy_df['MACD_signal'].iloc[-1] and
-                #         after_buy_df['MACD'].iloc[-2] >= after_buy_df['MACD_signal'].iloc[-2]
-                # )
-                #
-                # print(f'rsi_above_72 : {rsi_above_72}')
-                # print(f'macd_cross_down : {macd_cross_down}')
-                #
-                # if rsi_above_72 and macd_cross_down:
-                #     print('sell_signal - [상승장] RSI > 72 once and MACD cross down')
-                #     return {
-                #         "signal": "sell",
-                #         "message": "[상승장] RSI > 72 once and MACD cross down"
-                #     }
-
-            else:
-                # 이전 캔들이 볼린저밴드 상단을 돌파한 경우 매도
-                if after_buy_df['close'].iloc[-2] > after_buy_df['BB_upper'].iloc[-2]:
-                    print('sell_signal - 이전 캔들이 볼린저밴드 상단 돌파')
-                    return {
-                        "signal": "sell",
-                        "message": "이전 캔들이 볼린저밴드 상단 돌파"
-                    }
-
-        else:
-            print('매수 이후 데이터 부족')
-            return {
-                "signal": "",
-                "message": "매수 이후 데이터 부족"
-            }
-
-            # else:
-            #     # 하락장 매도 조건 (거래량 + 볼린저밴드 상단 돌파)
-            #     prev_candle = after_buy_df.iloc[-2]
-            #
-            #     print(f'prev_candle["close"] : {prev_candle["close"]}')
-            #     print(f'prev_candle["BB_upper"] : {prev_candle["BB_upper"]}')
-            #     print(f'prev_candle["volume"] : {prev_candle["volume"]}')
-            #     print(f'prev_candle["Volume_MA20"] : {prev_candle["Volume_MA20"]}')
-            #
-            #     # 이전 캔들 기준으로 계산
-            #     # 이전 캔들의 종가가 볼린저밴드 상단을 돌파 and 거래량이 20일 이동평균을 초과
-            #     if (prev_candle['close'] >= prev_candle['BB_upper'] and
-            #             prev_candle['volume'] > prev_candle['Volume_MA20']):
-            #         print('sell_signal - [하락장] 이전 캔들이 볼린저밴드 상단 돌파 및 거래량 증가')
-            #         return {
-            #             "signal": "sell",
-            #             "message": "[하락장] 이전 캔들이 볼린저밴드 상단 돌파 및 거래량 증가"
-            #         }
-
-    return {
-        "signal": "",
-        "message": ""
-    }
+        return {"signal": "", "message": "매매 조건 미충족"}

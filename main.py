@@ -1,181 +1,261 @@
-import sys, os, math, time
-import logging.config
-from datetime import datetime, timedelta
+import logging
+import os
+import time
+
+import numpy as np
 from apscheduler.schedulers.background import BackgroundScheduler
-
-# 현재 스크립트의 디렉토리를 기반으로 logging.conf의 경로를 절대 경로로 지정
-current_dir = os.path.dirname(os.path.abspath(__file__))
-logging_conf_path = os.path.join(current_dir, 'logging.conf')
-
-# 로그 설정을 UTF-8로 강제 읽기
-logging.config.fileConfig(logging_conf_path, encoding='utf-8')
-logger = logging.getLogger(__name__)
-
-# account, upbit_data, trading, utils 디렉토리의 경로를 생성
-account_dir = os.path.join(current_dir, 'account')
-upbit_data_dir = os.path.join(current_dir, 'upbit_data')
-trading_dir = os.path.join(current_dir, 'trading')
-utils_dir = os.path.join(current_dir, 'utils')
-
-# sys.path에 account 디렉토리를 추가
-sys.path.append(account_dir)
-sys.path.append(upbit_data_dir)
-sys.path.append(trading_dir)
-sys.path.append(utils_dir)
-
-# import
-from account.my_account import get_my_exchange_account
+from utils.db import save_trade_record
+from account.my_account import get_my_exchange_account, get_balance
+from trading.trade import get_order_status, cancel_old_orders, check_order_status, buy_limit, sell_limit, get_min_trade_volume, get_tick_size
+from trading.trading_strategy import trading_strategy
 from upbit_data.candle import get_min_candle_data
-# from trading.trading_strategy import trading_strategy
-from trading.trading_strategy2 import trading_strategy
-from trading.trade import buy_market, sell_market, get_open_order
-from utils.email_utils import send_email
 
-# 전역변수
-buy_time = None  # 매수시간
-krw_balance = 0  # 계좌잔고(KRW)
 
-# 로그파일 경로
-log_dir = os.path.join(current_dir, 'logs')
+# 🔹 로깅 설정
+logger = logging.getLogger(__name__)
+log_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
-# 로그 폴더가 없으면 생성
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir)
-    print(f'로그 폴더 생성: {log_dir}')
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
 
-def get_account_info():
-    logger.info('========== get_account_info ==========')
+logger.addHandler(console_handler)
+logger.setLevel(logging.INFO)
 
-    # get my account
-    my_account = get_my_exchange_account()
+# 🔹 매매 설정
+TRADE_TICKERS = ['ETH', 'SOL', 'TRUMP', 'XRP', 'ZRO', 'VIRTUAL', 'ADA']
+INVEST_RATIO = 0.95 / len(TRADE_TICKERS)
+MAX_INVEST_AMOUNT = 400000
+MIN_ORDER_AMOUNT = 5000
+COOLDOWN_TIME = 30  # 초 단위
+MAX_WAIT_TIME = 20  # ✅ 미체결 주문 자동 취소 대기 시간 (초)
 
-    # 도지코인(DOGE) 기준으로 확인합니다. -> 솔라나(SOL)로 변경 + 도지코인(DOGE), 비트코인(BTC) 추가
-    sol_ticker = 'SOL'
-    is_sol_in_account = False
-    sol_balance = '0'
-    sol_avg_buy_price = 0.0
+# 🔹 상태 저장 변수
+position = {}  # ✅ 보유 코인 상태 저장
+market_data_cache = {}  # ✅ 시세 캐시
+last_trade_times = {}  # ✅ 최근 매매 시간 저장
 
-    if 'currency' not in my_account.columns:
-        raise ValueError('[currency] 컬럼이 존재하지 않습니다.')
 
-    if sol_ticker in my_account['currency'].values:
-        is_sol_in_account = True
-        sol_balance = my_account[my_account['currency'] == sol_ticker]['balance'].values[0]
-        sol_avg_buy_price = float(my_account[my_account['currency'] == sol_ticker]['avg_buy_price'].values[0])
+def update_market_data():
+  """🔄 각 코인의 최신 시세 데이터를 업데이트"""
+  global market_data_cache
+  logger.info("========== update_market_data() 실행 ==========")
 
-    logger.debug(f'is_sol_in_account : {is_sol_in_account}')
-    logger.debug(f'sol_balance : {sol_balance}')
-    logger.debug(f'sol_avg_buy_price : {sol_avg_buy_price}')
+  new_market_data = {}
 
-    # 원화 잔고 확인
-    krw_amount = 0.0
-    krw_ticker = 'KRW'
-    if krw_ticker in my_account['currency'].values:
-        my_account['balance'] = my_account['balance'].astype(float)
-        krw_amount = my_account[my_account['currency'] == krw_ticker]['balance'].values[0]
-
-    logger.debug(f'krw_amount : {krw_amount}')
-
-    # 투자 가능한 원화 계산
-    krw_invest_amount = math.floor(krw_amount * 0.999) if krw_amount > 0 else 0
-    logger.debug(f'krw_invest_amount : {krw_invest_amount}')
-
-    return {
-        'is_sol': is_sol_in_account,
-        'sol_balance': sol_balance,
-        'sol_buy_price': sol_avg_buy_price,
-        'krw_balance': krw_amount,
-        'krw_available': krw_invest_amount
-    }
-
-def check_time():
-    current_time = datetime.now()
-    current_minute = current_time.minute
-    is_multiple_of_five = current_minute % 5 == 0
-
-    logger.debug(f'current_time : {current_time}, current_minute : {current_minute}')
-    logger.debug(f'is_multiple_of_five : {is_multiple_of_five}')
-
-    return is_multiple_of_five
-
-def get_data():
-    return get_min_candle_data('KRW-SOL', 5)
-
-def auto_trading():
+  for ticker in TRADE_TICKERS:
     try:
-        account_info = get_account_info()
-        multiple_of_five = check_time()
-        current_position = 1 if account_info['is_sol'] else 0
-        logger.debug(f'current_position : {current_position}')
+      logger.info(f"📡 {ticker} 시세 데이터를 가져오는 중...")
+      data = get_min_candle_data(f'KRW-{ticker}', 1)
+      if data is None or data.empty or data.tail(1).isnull().values.any():
+        logger.warning(f"⚠️ {ticker} 시세 데이터 없음, 업데이트 건너뜀")
+        continue
 
-        global buy_time, krw_balance
+      new_market_data[ticker] = data.copy()
+      logger.info(f"✅ {ticker} 시세 업데이트 완료 | 현재가: {data['close'].iloc[-1]} | 거래량: {data['volume'].iloc[-1]}")
 
-        if current_position == 0 and multiple_of_five:
-            trade_strategy_result = trading_strategy(get_data(), current_position)
-            logger.debug(f'trade_strategy_result : {trade_strategy_result}')
-
-            if trade_strategy_result['signal'] == 'buy':
-                krw_balance = math.floor(account_info['krw_balance'])
-                buy_result = buy_market('KRW-SOL', account_info['krw_available'])
-
-                if buy_result['uuid'].notnull()[0]:
-                    min5_ago = datetime.now() - timedelta(minutes=5)
-                    buy_time = min5_ago.replace(second=0, microsecond=0).strftime('%Y-%m-%d %H:%M:%S')
-                    logger.info(f'[KRW-SOL] {account_info["krw_available"]}원 매수 하였습니다.')
-
-                    send_email('[KRW-SOL] 시장가 매수', trade_strategy_result['message'])
-                else:
-                    logger.error('매수가 정상적으로 처리되지 않았습니다.')
-
-        elif current_position == 1 and multiple_of_five:
-            trade_strategy_result = trading_strategy(get_data(), current_position, buy_time, account_info['sol_buy_price'])
-            logger.debug(f'trade_strategy_result : {trade_strategy_result}')
-
-            if trade_strategy_result['signal'] == 'sell':
-                sell_result = sell_market('KRW-SOL', account_info['sol_balance'])
-                if sell_result['uuid'].notnull()[0]:
-                    while True:
-                        open_order_df = get_open_order('KRW-SOL', 'wait')
-                        print(open_order_df)
-                        time.sleep(5)
-                        if len(open_order_df) == 0:
-                            break
-
-                    after_sell_account = get_my_exchange_account()
-                    print(after_sell_account)
-
-                    trade_result = 0
-                    if 'KRW' in after_sell_account['currency'].values:
-                        after_sell_krw_bal = math.floor(float(after_sell_account[after_sell_account['currency'] == 'KRW']['balance'].values[0]))
-                        trade_result = math.floor(after_sell_krw_bal - krw_balance)
-
-                    logger.info(f'[KRW-SOL] {account_info["sol_balance"]} 매도 하였습니다.')
-                    logger.info(f'매매수익은 {trade_result} 입니다.')
-
-                    buy_time = None
-                    krw_balance = 0
-
-                    send_email('[KRW-SOL] 시장가 매도', f'{trade_strategy_result["message"]}\n매매수익은 {trade_result} 입니다.')
-                else:
-                    logger.error('매도가 정상적으로 처리되지 않았습니다.')
-                    send_email('매도 중 에러 발생', '매도 중 에러가 발생하였습니다. 확인해주세요.')
-
-    except ValueError as ve:
-        logger.error(f'ValueError : {ve}')
     except Exception as e:
-        logger.error(f'예상치 못한 오류 발생 : {e}')
+      logger.error(f"🚨 {ticker} 시세 업데이트 오류 발생: {e}")
+
+  if not new_market_data:
+    logger.error("🚨 모든 시세 데이터가 없음. API 문제 가능성 있음!")
+
+  market_data_cache.update(new_market_data)
+
+
+def get_avg_buy_price(balance_data, ticker):
+  """업비트 API에서 평균 매수가(avg_buy_price)를 가져오되, 보유하지 않은 코인은 0으로 반환"""
+  asset_info = balance_data.get("assets", {}).get(ticker, {})
+
+  # ✅ **보유하지 않은 경우 평균 매수가 0으로 설정하여 매수 가능하도록 수정**
+  if not asset_info:
+    logger.info(f"⚠️ {ticker} 보유하지 않음. 평균 매수가 0으로 설정.")
+    return 0  # 🔥 **보유하지 않은 경우 0을 반환**
+
+  avg_price = asset_info.get("avg_buy_price")
+
+  if avg_price is None or avg_price == 0:
+    logger.warning(f"⚠️ {ticker} 평균 매수가 없음 → API 재조회 시도")
+
+    # ✅ API 재조회
+    updated_balance = get_my_exchange_account()
+
+    if not updated_balance or "assets" not in updated_balance:
+      logger.error(f"🚨 {ticker} API 재조회 실패 → 응답 없음 또는 assets 키 누락")
+      return 0  # 🔥 **API 문제가 있어도 매수를 건너뛰지 않고 0 반환**
+
+    # ✅ 최신 balance_data 반영
+    balance_data.update(updated_balance)
+
+    # ✅ 최신 balance_data에서 다시 평균 매수가 가져오기
+    asset_info = balance_data["assets"].get(ticker, {})
+    avg_price = asset_info.get("avg_buy_price")
+
+    # ✅ DEBUG: API에서 가져온 데이터 로그 출력
+    logger.debug(f"🔍 {ticker} 재조회된 avg_buy_price: {avg_price}")
+
+    # ✅ **여전히 평균 매수가 없으면 0으로 반환 (매수 가능)**
+    if avg_price is None or avg_price == 0:
+      logger.warning(f"⚠️ {ticker} 평균 매수가 없으므로 0으로 설정.")
+      return 0  # 🔥 **보유하지 않은 코인은 매수할 수 있도록 0 반환**
+
+  return float(avg_price)
+
+def execute_trade():
+  """📌 매매 전략 실행 및 주문 처리"""
+  global position
+
+  # ✅ 최신 시세 데이터 업데이트
+  update_market_data()
+
+  # ✅ 업비트 API에서 보유 자산 정보 조회
+  my_balance = get_my_exchange_account()
+  if not my_balance:
+    logger.error("🚨 업비트 API에서 보유 코인 데이터를 가져오지 못함. 거래 불가.")
+    return
+
+  available_krw = my_balance.get("KRW", 0)
+  position = my_balance.get("assets", {})
+
+  if available_krw < MIN_ORDER_AMOUNT:
+    logger.warning(f"⚠️ 사용 가능한 원화 부족! 현재 잔고: {available_krw}원")
+    return
+
+  for ticker in TRADE_TICKERS:
+    if ticker not in market_data_cache:
+      continue
+
+    df = market_data_cache[ticker]
+    if df is None or df.empty or df.isnull().values.any():
+      continue
+
+    try:
+      # ✅ **보유 여부와 관계없이 매매 전략 실행**
+      is_holding = 1 if position.get(ticker, {}).get("balance", 0) > 0 else 0
+
+      # ✅ **보유하지 않은 코인도 매수할 수 있도록 평균 매수가 기본값을 0으로 설정**
+      avg_buy_price = get_avg_buy_price(my_balance, ticker) or 0
+
+      # ✅ **매매 전략 실행**
+      strategy_result = trading_strategy(df, is_holding, ticker=ticker, buy_price=avg_buy_price) or {}
+
+      signal = strategy_result.get("signal", "None")
+      message = strategy_result.get("message", "")
+
+      if signal not in ["buy", "sell"]:
+          continue
+
+      logger.info(f"📌 {ticker} 매매 전략 실행 결과 - signal: {signal}, message: {message}")
+
+      # ✅ **쿨다운 적용 (30초 내 재매매 금지)**
+      last_trade_time = last_trade_times.get(ticker, 0)
+      if time.time() - last_trade_time < COOLDOWN_TIME:
+          continue
+
+      # ✅ **미체결 주문 확인 및 자동 취소 (매매 전에 먼저 실행)**
+      cancel_old_orders(f"KRW-{ticker}", MAX_WAIT_TIME)
+
+      # ✅ 최소 거래 금액 고려 (업비트 최소 주문 단위 적용)
+      min_trade_volume = get_min_trade_volume(f"KRW-{ticker}")
+
+      # ✅ balance를 추가 조회하지 않도록 변경
+      if signal == "buy":
+        invest_amount = min(available_krw * INVEST_RATIO, MAX_INVEST_AMOUNT)
+        if invest_amount < MIN_ORDER_AMOUNT:
+          logger.warning(f"🚨 {ticker} 지정가 매수 주문 실패: 주문 금액({invest_amount}원)이 최소 거래 금액({MIN_ORDER_AMOUNT}원)보다 작음")
+          continue
+
+        buy_price = get_tick_size(df['close'].iloc[-1] * 0.995)  # ✅ 업비트 호가 단위 적용
+        volume = invest_amount / buy_price  # ✅ 코인 개수 계산
+
+        if volume < min_trade_volume:
+          logger.warning(f"🚨 {ticker} 지정가 매수 주문 실패: volume({volume})이 최소 거래 단위({min_trade_volume})보다 작음")
+          continue
+
+        # ✅ 지정가 매수 주문 실행
+        trade_result = buy_limit(f"KRW-{ticker}", buy_price, volume)
+
+        if not trade_result or "uuid" not in trade_result:
+          logger.error(f"🚨 {ticker} 지정가 매수 주문 실패 - 응답 오류: {trade_result}")
+          continue
+
+        order_uuid = trade_result["uuid"]
+        last_trade_times[ticker] = time.time()
+        logger.info(f"📌 {ticker} 지정가 매수 주문 완료 - 주문 UUID: {order_uuid}")
+
+        # ✅ 주문 상태 확인 추가
+        order_status = check_order_status(order_uuid)
+        order_state = order_status.get("state", "확인 불가")
+
+        if order_state in ["wait", "watch"]:
+          logger.warning(f"⚠️ {ticker} 미체결 매수 주문 발생 - 현재 상태: {order_state}")
+
+
+      if signal == "sell":
+        sell_price = get_tick_size(df['close'].iloc[-1] * 1.005)  # ✅ 업비트 호가 단위 적용
+        sell_volume = position.get(ticker, {}).get("balance", 0)
+
+        if sell_volume < min_trade_volume:
+          logger.warning(f"🚨 {ticker} 지정가 매도 주문 실패: 보유 수량({sell_volume})이 최소 거래 단위({min_trade_volume})보다 작음")
+          continue
+
+        trade_result = sell_limit(f"KRW-{ticker}", sell_price, sell_volume)
+
+        if not trade_result or "uuid" not in trade_result:
+          logger.warning(f"🚨 {ticker} 매도 주문 실패 - API 응답 오류: {trade_result}")
+          continue
+
+        order_uuid = trade_result["uuid"]
+        last_trade_times[ticker] = time.time()
+        logger.info(f"✅ {ticker} 지정가 매도 주문 완료 - 주문 UUID: {order_uuid}")
+
+        # ✅ 주문 상태 확인 추가
+        order_status = check_order_status(order_uuid)
+        order_state = order_status.get("state", "확인 불가")
+
+        if order_state in ["wait", "watch"]:
+          logger.warning(f"⚠️ {ticker} 미체결 매도 주문 발생 - 현재 상태: {order_state}")
+
+        # ✅ 미체결 주문 확인 및 자동 취소
+        cancel_old_orders(f"KRW-{ticker}", MAX_WAIT_TIME)
+
+        # ✅ 주문 상태 확인 (옵션)
+        order_status = check_order_status(order_uuid)
+        logger.info(f"📌 {ticker} 매도 주문 상태: {order_status.get('state', '확인 불가')}")
+
+        # 🔥 **매도 후 최신 잔고 다시 조회 (효율적 방식)**
+        time.sleep(1)  # API 호출 부담을 줄이기 위해 1초 대기
+        my_balance = get_my_exchange_account()
+        available_krw = my_balance.get("KRW", 0)
+        position = my_balance.get("assets", {})
+
+        # ✅ DEBUG 로그 추가
+        logger.debug(f"🔄 최신 position 데이터: {position}")
+
+    except Exception as e:
+        logger.error(f"🚨 {ticker} 매매 전략 실행 중 오류 발생: {e}", exc_info=True)
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(execute_trade, 'interval', seconds=10, max_instances=4)
+scheduler.start()
 
 if __name__ == '__main__':
-    logger.info('++++++++++ apscheduler starts. ++++++++++')
-    scheduler_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    logger.info(f'scheduler_start_time : {scheduler_start_time}')
+  logger.info('++++++++++ 자동매매 시작 ++++++++++')
 
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(auto_trading, 'cron', second=5)
-    scheduler.start()
+  # ✅ 최신 보유 코인 정보 동기화
+  my_balance = get_my_exchange_account()
+  if my_balance:
+    position = my_balance["assets"]
 
-    try:
-        while True:
-            time.sleep(2)
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
+    # ✅ DEBUG: API 응답 확인
+    logger.info(f"🔍 초기 my_balance 데이터: {my_balance}")
+    logger.info("✅ 초기 보유 코인 정보 동기화 완료")
+  else:
+    logger.error("🚨 초기 보유 코인 정보를 가져오지 못했습니다. 자동매매를 시작할 수 없습니다.")
+    exit(1)  # 강제 종료
+
+  try:
+    while True:
+      time.sleep(10)
+  except (KeyboardInterrupt, SystemExit):
+    logger.warning("⛔ 자동매매 종료 요청 감지. 시스템 종료 중...")
+    scheduler.shutdown()
