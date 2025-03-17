@@ -112,13 +112,15 @@ def get_order_status(uuid: str) -> dict:
                 time.sleep(1)
                 continue  # 재시도
 
-            data = response.json()
+            if response.status_code == 200:
+                data = response.json()
 
-            if "trades" in data and data["trades"]:  # ✅ 체결된 거래 내역이 있을 경우
-                executed_price = float(data["trades"][0]["price"])  # ✅ 체결 가격 가져오기
-                return {"uuid": uuid, "price": executed_price}
+                if "trades" in data and data["trades"]:  # ✅ 체결된 거래 내역이 있을 경우
+                    executed_price = float(data["trades"][0]["price"])  # ✅ 체결 가격 가져오기
+                    return {"uuid": uuid, "price": executed_price}
 
-            return data  # ✅ 정상 응답 시 반환
+                print(f"⚠️ {uuid} 주문은 체결되지 않았습니다.")
+                return data  # ✅ 정상 응답 시 반환
 
         except requests.exceptions.RequestException as e:
             print(f"🚨 {uuid} 주문 상태 조회 요청 실패: {e}")
@@ -200,11 +202,11 @@ def cancel_old_orders(market: str, max_wait_time=30):
         if current_time - order_timestamp > max_wait_time:
             cancel_result = cancel_order(order_uuid)
 
-        # ✅ 주문 취소 결과 로그 추가
-        if cancel_result.get("state") == "cancel":
-            print(f"✅ {market} 미체결 주문 취소 완료 - 주문 UUID: {order_uuid}")
-        else:
-            print(f"⚠️ {market} 미체결 주문 취소 실패 - 주문 UUID: {order_uuid}")
+            # ✅ cancel_result가 None이 아닌지 확인하고 처리
+            if cancel_result and cancel_result.get("state") == "cancel":
+                print(f"✅ {market} 미체결 주문 취소 완료 - 주문 UUID: {order_uuid}")
+            else:
+                print(f"⚠️ {market} 미체결 주문 취소 실패 - 주문 UUID: {order_uuid}")
 
 
 def cancel_order(order_uuid):

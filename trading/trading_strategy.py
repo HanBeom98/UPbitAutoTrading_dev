@@ -123,17 +123,29 @@ def trading_strategy(df: pd.DataFrame, position: int, ticker: str, buy_price: Op
         # ✅ 실질 손익 계산
         net_profit = (latest_close * (1 - fee_rate)) - (buy_price * (1 + fee_rate))
 
+        # ✅ 손절 및 익절 값이 제대로 계산되는지 확인
+        logger.info(f"📊 {ticker} 매도 전략 - 손절가: {stop_loss:.2f}, 익절가: {take_profit:.2f}")
+
         # ✅ 손절 실행
         if latest_close < stop_loss:
             trading_context.consecutive_losses += 1
             trading_context.last_sell_time = datetime.now()
             logger.info(f"❌ {ticker} 손절 실행 (손절가: {stop_loss:.2f}원, 실제 손익: {net_profit:.2f}원)")
-            return {"signal": "sell", "message": f"손절 실행 (손절가: {stop_loss:.2f}원, 실제 손익: {net_profit:.2f}원)"}
+            return {
+                "signal": "sell",
+                "message": f"손절 실행 (손절가: {stop_loss:.2f}원, 실제 손익: {net_profit:.2f}원)",
+                "stop_loss": stop_loss,
+                "take_profit": take_profit
+            }
 
         # ✅ 익절 실행
         if latest_close >= take_profit and net_profit > 0:
             trading_context.consecutive_losses = max(0, trading_context.consecutive_losses - 2)
             logger.info(f"✅ {ticker} 익절 발생 → 손절 횟수 2단계 감소 (현재 손절 횟수: {trading_context.consecutive_losses})")
-            return {"signal": "sell", "message": f"익절 실행 (손절 횟수: {trading_context.consecutive_losses})"}
+            return {"signal": "sell",
+                    "message": f"익절 실행 (손절 횟수: {trading_context.consecutive_losses})",
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit
+                    }
 
         return {"signal": "", "message": "매매 조건 미충족"}
