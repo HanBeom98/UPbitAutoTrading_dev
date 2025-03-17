@@ -6,7 +6,7 @@ import numpy as np
 from apscheduler.schedulers.background import BackgroundScheduler
 from utils.db import save_trade_record
 from account.my_account import get_my_exchange_account, get_balance
-from trading.trade import get_order_status, cancel_old_orders, check_order_status, buy_limit, sell_limit, get_min_trade_volume, get_tick_size
+from trading.trade import get_order_status, cancel_old_orders, check_order_status, buy_limit, sell_limit, get_min_trade_volume, get_tick_size, sell_market
 from trading.trading_strategy import trading_strategy
 from upbit_data.candle import get_min_candle_data
 
@@ -139,17 +139,24 @@ def execute_trade():
       strategy_result = trading_strategy(df, is_holding, ticker=ticker, buy_price=avg_buy_price) or {}
 
       signal = strategy_result.get("signal", "None")
-      message = strategy_result.get("message", "")
 
+      # ✅ 매매 시그널이 없는 경우 로그 추가
       if signal not in ["buy", "sell"]:
+          logger.info(f"⚠️ {ticker} 매매 시그널 없음. 전략 결과: {strategy_result}")
           continue
 
-      logger.info(f"📌 {ticker} 매매 전략 실행 결과 - signal: {signal}, message: {message}")
+      message = strategy_result.get("message", "")
+      stop_loss = strategy_result.get("stop_loss", None)  # 손절가
+      take_profit = strategy_result.get("take_profit", None)  # 익절가
+      buy_target_price = strategy_result.get("buy_target_price", df['close'].iloc[-1] * 0.999)  # 매수 목표가 추가
 
-      # ✅ **쿨다운 적용 (30초 내 재매매 금지)**
-      last_trade_time = last_trade_times.get(ticker, 0)
-      if time.time() - last_trade_time < COOLDOWN_TIME:
-          continue
+      # ✅ 매수 및 매도 시도 로그 추가
+      if signal == "buy":
+        logger.info(f"📌 {ticker} 매수 시도 중... 목표가: {buy_target_price}")
+      elif signal == "sell":
+        logger.info(f"📌 {ticker} 매도 시도 중... 손절가: {stop_loss}, 익절가: {take_profit}")
+
+      logger.info(f"📌 {ticker} 매매 전략 실행 결과 - signal: {signal}, message: {message}, stop_loss: {stop_loss}, take_profit: {take_profit}")
 
       # ✅ **미체결 주문 확인 및 자동 취소 (매매 전에 먼저 실행)**
       cancel_old_orders(f"KRW-{ticker}", MAX_WAIT_TIME)
@@ -157,52 +164,65 @@ def execute_trade():
       # ✅ 최소 거래 금액 고려 (업비트 최소 주문 단위 적용)
       min_trade_volume = get_min_trade_volume(f"KRW-{ticker}")
 
-      # ✅ balance를 추가 조회하지 않도록 변경
+      # ✅ 매수 로직 수정 (buy_target_price 적용)
       if signal == "buy":
-        invest_amount = min(available_krw * INVEST_RATIO, MAX_INVEST_AMOUNT)
-        if invest_amount < MIN_ORDER_AMOUNT:
-          logger.warning(f"🚨 {ticker} 지정가 매수 주문 실패: 주문 금액({invest_amount}원)이 최소 거래 금액({MIN_ORDER_AMOUNT}원)보다 작음")
-          continue
+          last_trade_time = last_trade_times.get(ticker, 0)
+          if time.time() - last_trade_time < COOLDOWN_TIME:
+              logger.info(f"⏳ {ticker} 쿨다운 적용 중. 남은 시간: {COOLDOWN_TIME - (time.time() - last_trade_time)}초")
+              continue  # ✅ 쿨다운 중이면 매매 안 함
 
-        buy_price = get_tick_size(df['close'].iloc[-1] * 0.995)  # ✅ 업비트 호가 단위 적용
-        volume = invest_amount / buy_price  # ✅ 코인 개수 계산
+          invest_amount = min(available_krw * INVEST_RATIO, MAX_INVEST_AMOUNT)
+          buy_price = get_tick_size(buy_target_price)
+          volume = invest_amount / buy_price
 
-        if volume < min_trade_volume:
-          logger.warning(f"🚨 {ticker} 지정가 매수 주문 실패: volume({volume})이 최소 거래 단위({min_trade_volume})보다 작음")
-          continue
+          if volume >= min_trade_volume:
+              trade_result = buy_limit(f"KRW-{ticker}", buy_price, volume)
 
-        # ✅ 지정가 매수 주문 실행
-        trade_result = buy_limit(f"KRW-{ticker}", buy_price, volume)
+              if not trade_result or "uuid" not in trade_result:
+                logger.error(f"🚨 {ticker} 지정가 매수 주문 실패 - 응답 오류: {trade_result}")
+                continue
 
-        if not trade_result or "uuid" not in trade_result:
-          logger.error(f"🚨 {ticker} 지정가 매수 주문 실패 - 응답 오류: {trade_result}")
-          continue
+              order_uuid = trade_result["uuid"]
+              logger.info(f"📌 {ticker} 지정가 매수 주문 완료 - 주문 UUID: {order_uuid}")
 
-        order_uuid = trade_result["uuid"]
-        last_trade_times[ticker] = time.time()
-        logger.info(f"📌 {ticker} 지정가 매수 주문 완료 - 주문 UUID: {order_uuid}")
+              # ✅ 주문 상태 확인 추가
+              order_status = check_order_status(order_uuid)
+              order_state = order_status.get("state", "확인 불가")
 
-        # ✅ 주문 상태 확인 추가
-        order_status = check_order_status(order_uuid)
-        order_state = order_status.get("state", "확인 불가")
+              if order_state == "done":  # 🔥 매수가 체결되었을 때만 쿨다운 적용
+                  last_trade_times[ticker] = time.time()
+                  logger.info(f"✅ {ticker} 매수 체결 완료 → 쿨다운 적용 시작")
 
-        if order_state in ["wait", "watch"]:
-          logger.warning(f"⚠️ {ticker} 미체결 매수 주문 발생 - 현재 상태: {order_state}")
+              elif order_state in ["wait", "watch"]:  # ✅ 미체결 주문은 쿨다운 적용 안 함
+                  logger.warning(f"⚠️ {ticker} 미체결 매수 주문 발생 - 현재 상태: {order_state}")
 
-
+      # ✅ 매도 로직 수정 (trading_strategy() 반영)
       if signal == "sell":
-        sell_price = get_tick_size(df['close'].iloc[-1] * 1.005)  # ✅ 업비트 호가 단위 적용
         sell_volume = position.get(ticker, {}).get("balance", 0)
 
-        if sell_volume < min_trade_volume:
-          logger.warning(f"🚨 {ticker} 지정가 매도 주문 실패: 보유 수량({sell_volume})이 최소 거래 단위({min_trade_volume})보다 작음")
+        if sell_volume <= 0:
+          logger.warning(f"⚠️ {ticker} 매도 실패! 보유량이 없음.")
           continue
 
-        trade_result = sell_limit(f"KRW-{ticker}", sell_price, sell_volume)
+        trade_result = None  # 🔥 trade_result를 미리 선언
+
+        if df['close'].iloc[-1] < stop_loss:
+            # ✅ 손절 시 시장가 매도
+            logger.info(f"🚨 {ticker} 손절 실행! 현재가({df['close'].iloc[-1]}) < 손절가({stop_loss}) → 시장가 매도")
+            trade_result = sell_market(f"KRW-{ticker}", sell_volume)
+
+            if not trade_result or "uuid" not in trade_result:
+              logger.warning(f"🚨 {ticker} 시장가 매도 실패 - API 응답 오류: {trade_result}")
+              continue
+
+        elif take_profit:
+            # ✅ 익절 시 지정가 매도
+            sell_price = get_tick_size(take_profit)
+            trade_result = sell_limit(f"KRW-{ticker}", sell_price, sell_volume)
 
         if not trade_result or "uuid" not in trade_result:
-          logger.warning(f"🚨 {ticker} 매도 주문 실패 - API 응답 오류: {trade_result}")
-          continue
+            logger.warning(f"🚨 {ticker} 매도 주문 실패 - API 응답 오류: {trade_result}")
+            continue
 
         order_uuid = trade_result["uuid"]
         last_trade_times[ticker] = time.time()
@@ -213,7 +233,7 @@ def execute_trade():
         order_state = order_status.get("state", "확인 불가")
 
         if order_state in ["wait", "watch"]:
-          logger.warning(f"⚠️ {ticker} 미체결 매도 주문 발생 - 현재 상태: {order_state}")
+            logger.warning(f"⚠️ {ticker} 미체결 매도 주문 발생 - 현재 상태: {order_state}")
 
         # ✅ 미체결 주문 확인 및 자동 취소
         cancel_old_orders(f"KRW-{ticker}", MAX_WAIT_TIME)
@@ -232,7 +252,7 @@ def execute_trade():
         logger.debug(f"🔄 최신 position 데이터: {position}")
 
     except Exception as e:
-        logger.error(f"🚨 {ticker} 매매 전략 실행 중 오류 발생: {e}", exc_info=True)
+      logger.error(f"🚨 {ticker} 매매 전략 실행 중 오류 발생: {e}", exc_info=True)
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(execute_trade, 'interval', seconds=10, max_instances=4)
