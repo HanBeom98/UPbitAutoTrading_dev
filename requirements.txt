@@ -21,3 +21,5 @@ tzlocal==5.2
 urllib3==1.26.15
 websockets==14.1
 numpy~=2.0.2
+websocket-client
+psycopg2
