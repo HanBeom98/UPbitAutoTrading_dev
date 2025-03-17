@@ -6,7 +6,9 @@ import numpy as np
 from apscheduler.schedulers.background import BackgroundScheduler
 from utils.db import save_trade_record
 from account.my_account import get_my_exchange_account, get_balance
-from trading.trade import get_order_status, cancel_old_orders, check_order_status, buy_limit, sell_limit, get_min_trade_volume, get_tick_size, sell_market
+from trading.trade import get_order_status, cancel_old_orders, \
+  check_order_status, buy_limit, sell_limit, get_min_trade_volume, \
+  get_tick_size, sell_market, buy_market, get_current_price
 from trading.trading_strategy import trading_strategy
 from upbit_data.candle import get_min_candle_data
 
@@ -138,6 +140,8 @@ def execute_trade():
       # ✅ **매매 전략 실행**
       strategy_result = trading_strategy(df, is_holding, ticker=ticker, buy_price=avg_buy_price) or {}
 
+      logger.debug(f"🔍 {ticker} 전략 반환값: {strategy_result}")
+
       signal = strategy_result.get("signal", "None")
 
       # ✅ 매매 시그널이 없는 경우 로그 추가
@@ -185,16 +189,41 @@ def execute_trade():
               order_uuid = trade_result["uuid"]
               logger.info(f"📌 {ticker} 지정가 매수 주문 완료 - 주문 UUID: {order_uuid}")
 
-              # ✅ 주문 상태 확인 추가
-              order_status = check_order_status(order_uuid)
-              order_state = order_status.get("state", "확인 불가")
+              # ✅ 주문 후 일정 시간(예: 10초) 동안 체결 여부 확인
+              wait_time = 10  # 주문 유지 시간 (초)
+              start_time = time.time()
 
-              if order_state == "done":  # 🔥 매수가 체결되었을 때만 쿨다운 적용
-                  last_trade_times[ticker] = time.time()
-                  logger.info(f"✅ {ticker} 매수 체결 완료 → 쿨다운 적용 시작")
+              while time.time() - start_time < wait_time:
+                  # ✅ 주문 상태 확인 추가
+                  time.sleep(1)  # 🔥 API 업데이트 시간이 필요할 수 있음
+                  order_status = check_order_status(order_uuid)
+                  order_state = order_status.get("state", "확인 불가")
 
-              elif order_state in ["wait", "watch"]:  # ✅ 미체결 주문은 쿨다운 적용 안 함
-                  logger.warning(f"⚠️ {ticker} 미체결 매수 주문 발생 - 현재 상태: {order_state}")
+                  if order_state == "done":
+                      last_trade_times[ticker] = time.time()
+                      logger.info(f"✅ {ticker} 매수 체결 완료 - 주문 UUID: {order_uuid}, 체결 가격: {order_status.get('price', '미확인')}")
+                      break  # 🔥 체결되면 즉시 루프 탈출
+
+                  logger.info(f"⏳ {ticker} 매수 주문 대기 중... 현재 상태: {order_state}")
+
+              else:
+                  logger.warning(f"⚠️ {ticker} 매수 주문이 10초 동안 체결되지 않음 → 주문 취소 진행")
+                  cancel_old_orders(f"KRW-{ticker}", MAX_WAIT_TIME)
+
+                  # ✅ 🔥 시장가 매수 시도 (단, 현재 가격이 너무 높으면 취소)
+                  current_price = get_current_price(f"KRW-{ticker}")
+                  max_acceptable_price = buy_target_price * 1.0020  # 🔥 0.20% 이상 차이나면 취소
+
+                  if current_price <= max_acceptable_price:
+                    logger.info(f"🚀 {ticker} 시장가 매수 시도 - 현재가: {current_price}")
+                    trade_result = buy_market(f"KRW-{ticker}", invest_amount)
+
+                    if trade_result and "uuid" in trade_result:
+                        logger.info(f"✅ {ticker} 시장가 매수 완료 - 주문 UUID: {trade_result['uuid']}")
+                    else:
+                        logger.warning(f"🚨 {ticker} 시장가 매수 실패")
+                  else:
+                      logger.warning(f"⚠️ {ticker} 시장가 매수 취소 - 현재가 {current_price} (허용 범위 초과)")
 
       # ✅ 매도 로직 수정 (trading_strategy() 반영)
       if signal == "sell":
@@ -206,7 +235,8 @@ def execute_trade():
 
         trade_result = None  # 🔥 trade_result를 미리 선언
 
-        if df['close'].iloc[-1] < stop_loss:
+        # stop_loss가 None이 아니고, 현재가가 손절가보다 작은 경우에만 손절 처리
+        if stop_loss is not None and df['close'].iloc[-1] < stop_loss:
             # ✅ 손절 시 시장가 매도
             logger.info(f"🚨 {ticker} 손절 실행! 현재가({df['close'].iloc[-1]}) < 손절가({stop_loss}) → 시장가 매도")
             trade_result = sell_market(f"KRW-{ticker}", sell_volume)
@@ -228,17 +258,26 @@ def execute_trade():
         last_trade_times[ticker] = time.time()
         logger.info(f"✅ {ticker} 지정가 매도 주문 완료 - 주문 UUID: {order_uuid}")
 
-        # ✅ 주문 상태 확인 추가
-        order_status = check_order_status(order_uuid)
-        order_state = order_status.get("state", "확인 불가")
+        # ✅ 주문 후 일정 시간(예: 10초) 동안 체결 여부 확인
+        wait_time = 10  # 주문 유지 시간 (초)
+        start_time = time.time()
 
-        if order_state in ["wait", "watch"]:
-            logger.warning(f"⚠️ {ticker} 미체결 매도 주문 발생 - 현재 상태: {order_state}")
+        while time.time() - start_time < wait_time:
+            time.sleep(1)  # 🔥 API 업데이트 시간이 필요할 수 있음
+            order_status = check_order_status(order_uuid)
+            order_state = order_status.get("state", "확인 불가")
 
-        # ✅ 미체결 주문 확인 및 자동 취소
-        cancel_old_orders(f"KRW-{ticker}", MAX_WAIT_TIME)
+            if order_state == "done":
+                logger.info(f"✅ {ticker} 매도 체결 완료 - 주문 UUID: {order_uuid}, 체결 가격: {order_status.get('price', '미확인')}")
+                break  # 🔥 체결되면 즉시 루프 탈출
 
-        # ✅ 주문 상태 확인 (옵션)
+            logger.info(f"⏳ {ticker} 매도 주문 대기 중... 현재 상태: {order_state}")
+
+        else:
+            logger.warning(f"⚠️ {ticker} 매도 주문이 10초 동안 체결되지 않음 → 주문 취소 진행")
+            cancel_old_orders(f"KRW-{ticker}", MAX_WAIT_TIME)
+
+        # ✅ 미체결 주문 확인 및 자동 취소 후, 최종 주문 상태 확인
         order_status = check_order_status(order_uuid)
         logger.info(f"📌 {ticker} 매도 주문 상태: {order_status.get('state', '확인 불가')}")
 
