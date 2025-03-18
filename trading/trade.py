@@ -199,17 +199,34 @@ def cancel_old_orders(market: str, max_wait_time=30):
             print(f"🚨 {market} 주문 생성 시간 형식 오류: {created_at}")
             continue
 
+        # ✅ 특정 시간 이상 경과한 주문 취소
         if current_time - order_timestamp > max_wait_time:
             cancel_result = cancel_order(order_uuid)
 
             # ✅ cancel_result가 None이 아닌지 확인하고 처리
-            if cancel_result and cancel_result.get("state") == "cancel":
+            if not cancel_result or cancel_result.get("state") != "cancel":
                 print(f"✅ {market} 미체결 주문 취소 완료 - 주문 UUID: {order_uuid}")
-            else:
-                print(f"⚠️ {market} 미체결 주문 취소 실패 - 주문 UUID: {order_uuid}")
+                continue  # 취소 실패한 경우 계속 진행하지 않음
+
+            print(f"✅ {market} 미체결 주문 취소 완료 - 주문 UUID: {order_uuid}")
+
+        time.sleep(2)
+
+        for i in range(5):
+            open_orders = get_open_orders(market)
+
+            if not open_orders:
+                print(f"✅ {market} 모든 미체결 주문이 취소됨.")
+                return
+
+            print(f"⚠️ {market} 미체결 주문이 아직 존재! ({i+1}/5) → 추가 확인 진행")
+            time.sleep(2)
+
+        # ✅ 마지막까지 취소되지 않은 주문이 있다면 로그 출력
+        print(f"🚨 {market} 미체결 주문이 여전히 존재! → 취소 실패 가능성 있음")
 
 
-def cancel_order(order_uuid):
+def cancel_order(order_uuid, max_retries=3):
     """📌 미체결 주문 취소"""
     if not order_uuid:
         print("🚨 주문 UUID가 제공되지 않았습니다.")
@@ -217,8 +234,20 @@ def cancel_order(order_uuid):
 
     params = {"uuid": order_uuid}
     headers = generate_auth_headers(params)
-    response = requests.delete(ORDER_STATUS_URL, params=params, headers=headers)
-    return validate_response(response)
+
+    for attempt in range(max_retries):
+        response = requests.delete(ORDER_STATUS_URL, params=params, headers=headers)
+        result = validate_response(response)
+
+        if result and result.get("state") == "cancel":
+            print(f"✅ 주문 취소 완료 - UUID: {order_uuid}")
+            return result
+
+        print(f"⚠️ 주문 취소 실패! {attempt + 1}/{max_retries} 재시도 중... UUID: {order_uuid}")
+        time.sleep(1)
+
+    print(f"🚨 주문 취소 최종 실패! UUID: {order_uuid}")
+    return {}
 
 ### 📌 **지정가 매수**
 def buy_limit(market: str, price: float, volume: float) -> dict:

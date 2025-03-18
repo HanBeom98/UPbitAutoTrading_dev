@@ -8,7 +8,7 @@ from utils.db import save_trade_record
 from account.my_account import get_my_exchange_account, get_balance
 from trading.trade import get_order_status, cancel_old_orders, \
   check_order_status, buy_limit, sell_limit, get_min_trade_volume, \
-  get_tick_size, sell_market, buy_market, get_current_price
+  get_tick_size, sell_market, buy_market, get_current_price, get_open_orders
 from trading.trading_strategy import trading_strategy
 from upbit_data.candle import get_min_candle_data
 
@@ -28,7 +28,7 @@ TRADE_TICKERS = ['ETH', 'SOL', 'TRUMP', 'XRP', 'ZRO', 'VIRTUAL', 'ADA']
 INVEST_RATIO = 0.95 / len(TRADE_TICKERS)
 MAX_INVEST_AMOUNT = 400000
 MIN_ORDER_AMOUNT = 5000
-COOLDOWN_TIME = 30  # 초 단위
+COOLDOWN_TIME = 60  # 초 단위
 MAX_WAIT_TIME = 20  # ✅ 미체결 주문 자동 취소 대기 시간 (초)
 
 # 🔹 상태 저장 변수
@@ -210,18 +210,37 @@ def execute_trade():
                   logger.warning(f"⚠️ {ticker} 매수 주문이 10초 동안 체결되지 않음 → 주문 취소 진행")
                   cancel_old_orders(f"KRW-{ticker}", MAX_WAIT_TIME)
 
+              # ✅ 기존 주문 취소 시도
+              cancel_old_orders(f"KRW-{ticker}", MAX_WAIT_TIME)
+
+
+              # ✅ 주문 취소 후, 미체결 주문이 있는지 3초 대기 후 확인
+
+              time.sleep(3)
+              open_orders = get_open_orders(f"KRW-{ticker}")
+
+              # ✅ 아직 미체결 주문이 있다면 강제 취소 재실행
+              if open_orders:
+                  logger.warning(f"⚠️ {ticker} 미체결 주문이 아직 존재! 강제 취소 재실행")
+                  cancel_old_orders(f"KRW-{ticker}", MAX_WAIT_TIME)
+
+              # ✅ 최종적으로 미체결 주문이 있다면 시장가 매수 중단
+              open_orders = get_open_orders(f"KRW-{ticker}")
+              if open_orders:
+                  logger.warning(f"🚨 {ticker} 미체결 주문이 여전히 존재! → 시장가 매수 중단")
+              else:
                   # ✅ 🔥 시장가 매수 시도 (단, 현재 가격이 너무 높으면 취소)
                   current_price = get_current_price(f"KRW-{ticker}")
                   max_acceptable_price = buy_target_price * 1.0020  # 🔥 0.20% 이상 차이나면 취소
 
                   if current_price <= max_acceptable_price:
-                    logger.info(f"🚀 {ticker} 시장가 매수 시도 - 현재가: {current_price}")
-                    trade_result = buy_market(f"KRW-{ticker}", invest_amount)
+                      logger.info(f"🚀 {ticker} 시장가 매수 시도 - 현재가: {current_price}")
+                      trade_result = buy_market(f"KRW-{ticker}", invest_amount)
 
-                    if trade_result and "uuid" in trade_result:
-                        logger.info(f"✅ {ticker} 시장가 매수 완료 - 주문 UUID: {trade_result['uuid']}")
-                    else:
-                        logger.warning(f"🚨 {ticker} 시장가 매수 실패")
+                      if trade_result and "uuid" in trade_result:
+                          logger.info(f"✅ {ticker} 시장가 매수 완료 - 주문 UUID: {trade_result['uuid']}")
+                      else:
+                          logger.warning(f"🚨 {ticker} 시장가 매수 실패")
                   else:
                       logger.warning(f"⚠️ {ticker} 시장가 매수 취소 - 현재가 {current_price} (허용 범위 초과)")
 

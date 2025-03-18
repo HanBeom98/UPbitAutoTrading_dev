@@ -62,16 +62,30 @@ def trading_strategy(df: pd.DataFrame, position: int, ticker: str, buy_price: Op
 
     # 📌 **손절 3번 이상이면 30분 동안 매수 금지**
     if trading_context.consecutive_losses >= 3 and trading_context.last_sell_time:
-        time_since_last_sell = datetime.now() - trading_context.last_sell_time
+        time_since_last_sell = (datetime.now() - trading_context.last_sell_time).total_seconds()
         logger.warning(f"⛔ {ticker} 손절 {trading_context.consecutive_losses}번 → 매수 제한 (남은 시간: {30 - time_since_last_sell.seconds // 60}분)")
-        if time_since_last_sell < timedelta(minutes=30):  # 🔥 **손절 후 30분 제한**
+        if time_since_last_sell < 1800:  # 30분 = 1800초
             logger.warning(f"⛔ {ticker} 최근 손절 {trading_context.consecutive_losses}번 → 30분 동안 매수 금지 (남은 시간: {30 - time_since_last_sell.seconds // 60}분)")
             return {"signal": "", "message": "손절 3번 초과 → 30분 동안 매수 금지"}
-    else:
-        trading_context.consecutive_losses = 0  # 🔥 30분이 지나면 손절 횟수 초기화
+
+        # 🔥 30분이 지나면 손절 횟수를 바로 0으로 초기화하지 않고 점진적으로 감소
+        trading_context.consecutive_losses = max(1, trading_context.consecutive_losses - 2)
+        logger.info(f"✅ {ticker} 손절 제한 시간 종료 → 손절 횟수 감소: {trading_context.consecutive_losses}")
 
     # 📌 매수 조건
     if position == 0:
+        # ✅ 매수 후 최소 5분(300초) 대기
+        if trading_context.last_buy_time:
+            time_since_last_buy = (datetime.now() - trading_context.last_buy_time).total_seconds()
+            if time_since_last_buy < 300:  # 5분(300초) 대기
+                logger.warning(f"⛔ {ticker} 최근 매수 후 5분 미만 경과 → 매수 금지")
+                return {"signal": "", "message": "최근 매수 후 5분 미만 경과 → 매수 금지"}
+
+        # 🔥 동일 가격대에서 매수 반복 방지, 단 **3% 이상 조정되면 매수 가능**
+        if buy_price is not None and abs(df['close'].iloc[-1] - buy_price) < (buy_price * 0.03):  # 🔥 3% 이내 가격 변화
+            logger.warning(f"⛔ {ticker} 동일 가격대에서 매수 반복 방지 → 매수 취소 (최근 매수가: {buy_price}, 현재가: {df['close'].iloc[-1]})")
+            return {"signal": "", "message": "동일 가격대에서 매수 반복 방지"}
+
         logger.info(f"📊 {ticker} 매수 조건 평가 - EMA5: {df['EMA5'].iloc[-1]}, EMA15: {df['EMA15'].iloc[-1]}, MACD: {macd_histogram}, MACD_LONG: {macd_long_histogram}, RSI: {rsi_value}, Stoch_K: {stoch_k}, Stoch_D: {stoch_d}, 볼밴 하단: {bb_lower}, 거래량 급증 여부: {volume_spike}")
 
         # ✅ 손절 횟수에 따라 투자 비율을 점진적으로 줄이기
@@ -113,12 +127,18 @@ def trading_strategy(df: pd.DataFrame, position: int, ticker: str, buy_price: Op
 
     # 📌 매도 조건
     if position == 1 and buy_price is not None:
-        buy_price = float(buy_price)
+        buy_price = buy_price or df['close'].iloc[-1]  # 현재가를 대체값으로 설정
+
+        # ✅ 최소 손절가 설정 (매수가 대비 -2.5% 이하로 내려가지 않도록 보장)
+        MIN_STOP_LOSS = buy_price * 0.975  # 🔥 최소 손절가 (매수가의 97.5% 이상 유지)
+
+        MIN_ATR = buy_price * 0.01  # 최소 1% 수준의 변동성 반영
+        adjusted_atr = max(atr, MIN_ATR)  # ATR이 너무 작다면 최소 1% 변동성 보장
 
         # ✅ 트레일링 스탑 (내 매수가 기준)
-        trailing_stop = buy_price * (1 - trailing_stop_pct)
-        stop_loss = max(trailing_stop, buy_price * 0.98) * (1 - fee_rate)
-        take_profit = min(buy_price * 1.03, buy_price + (atr * 2))
+        trailing_stop = max(buy_price * (1 - trailing_stop_pct), recent_low, MIN_STOP_LOSS)
+        stop_loss = max(trailing_stop, buy_price - (adjusted_atr * 2)) * (1 - fee_rate)
+        take_profit = max(buy_price * 1.05, buy_price + (adjusted_atr * 2.5))
 
         # ✅ 실질 손익 계산
         net_profit = (latest_close * (1 - fee_rate)) - (buy_price * (1 + fee_rate))
