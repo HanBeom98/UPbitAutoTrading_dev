@@ -8,7 +8,8 @@ from utils.db import save_trade_record
 from account.my_account import get_my_exchange_account, get_balance
 from trading.trade import get_order_status, cancel_old_orders, \
   check_order_status, buy_limit, sell_limit, get_min_trade_volume, \
-  get_tick_size, sell_market, buy_market, get_current_price, get_open_orders
+  get_tick_size, sell_market, buy_market, get_current_price, get_open_orders, \
+  get_orderbook_data
 from trading.trading_strategy import trading_strategy
 from upbit_data.candle import get_min_candle_data
 
@@ -131,7 +132,7 @@ def execute_trade():
 
   for ticker in TRADE_TICKERS:
     if ticker not in market_data_cache:
-      continue
+        continue
 
     # ✅ 5분봉과 15분봉 데이터를 개별적으로 가져옴
     df_5m = market_data_cache[ticker].get("5m")
@@ -155,6 +156,14 @@ def execute_trade():
       logger.warning(f"⚠️ {ticker} 15분봉 데이터 오류 (컬럼 문제 가능): {df_15m.columns}")
       continue
 
+    # ✅ 주문장 데이터 가져오기 (df_orderbook 추가)
+    df_orderbook = get_orderbook_data(f"KRW-{ticker}")
+
+    # ✅ df_orderbook이 None이거나 비어 있으면 건너뜀
+    if df_orderbook is None or df_orderbook.empty:
+        logger.warning(f"⚠️ {ticker} 주문장 데이터 없음, 매매 전략 실행 건너뜀")
+        continue
+
     try:
       # ✅ **보유 여부와 관계없이 매매 전략 실행**
       is_holding = 1 if position.get(ticker, {}).get("balance", 0) > 0 else 0
@@ -163,7 +172,7 @@ def execute_trade():
       avg_buy_price = get_avg_buy_price(my_balance, ticker) or 0
 
       # ✅ **매매 전략 실행**
-      strategy_result = trading_strategy(df_5m, df_15m, is_holding, ticker=ticker, buy_price=avg_buy_price) or {}
+      strategy_result = trading_strategy(df_5m, df_15m, df_orderbook, is_holding, ticker=ticker, buy_price=avg_buy_price) or {}
 
       logger.debug(f"🔍 {ticker} 전략 반환값: {strategy_result}")
 
@@ -272,6 +281,7 @@ def execute_trade():
           max_acceptable_price = buy_target_price * 1.001  # 🔥 0.20% 이상 차이나면 취소
 
           if current_price <= max_acceptable_price:
+              time.sleep(1)  # API 요청 딜레이 고려
               available_krw = get_my_exchange_account().get("KRW", 0)
               invest_amount = min(available_krw, MAX_INVEST_AMOUNT)
 
