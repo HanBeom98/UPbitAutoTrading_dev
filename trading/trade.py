@@ -8,9 +8,7 @@ import numpy as np
 from urllib.parse import urlencode, unquote
 from dotenv import load_dotenv
 from datetime import datetime
-import random
-from typing import Optional
-
+import pandas as pd
 
 # ✅ 환경 변수 로드
 load_dotenv()
@@ -419,4 +417,25 @@ def calculate_stop_loss_take_profit(buy_price: float, atr: float, fee_rate: floa
 
     return stop_loss, take_profit
 
+def get_orderbook_data(market: str):
+    """📌 업비트 API에서 주문장 데이터를 가져와 DataFrame으로 변환"""
+    url = f"https://api.upbit.com/v1/orderbook?markets={market}"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()[0]  # 첫 번째 마켓 데이터 사용
+        orderbook_units = data["orderbook_units"]
+
+        df_orderbook = pd.DataFrame(orderbook_units)
+
+        df_orderbook.rename(columns={"bid_size": "buy_volume", "ask_size": "sell_volume"}, inplace=True)
+
+        df_orderbook["sell_wall"] = df_orderbook["sell_volume"].rolling(5).mean()  # 최근 5개 평균
+
+        df_orderbook["timestamp"] = pd.Timestamp.now()
+
+        return df_orderbook
+    except requests.RequestException as e:
+        print(f"🚨 주문장 데이터 가져오기 실패: {e}")
+        return pd.DataFrame()  # 비어 있는 DataFrame 반환
 
