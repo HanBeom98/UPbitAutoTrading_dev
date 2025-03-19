@@ -19,7 +19,8 @@ class TradingContext:
 
 trading_context = TradingContext()  # 공유 인스턴스
 
-def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, position: int, ticker: str,
+def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_orderbook: pd.DataFrame,
+                    position: int, ticker: str,
                     buy_price: Optional[float] = None, fee_rate: float = 0.0005,
                     ) -> dict:
     """📌 5분봉 + 15분봉을 활용한 단타 트레이딩 전략"""
@@ -30,6 +31,7 @@ def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, position: int, t
     # ✅ **데이터 정리 (결측치 처리)**
     df_5m = df_5m.copy().ffill().dropna()
     df_15m = df_15m.copy().ffill().dropna()
+    df_orderbook = df_orderbook.copy().ffill().dropna()
 
     # 🔥 데이터 유효성 검사 (5분봉 & 15분봉)
     if df_5m.empty or len(df_5m) < 200:
@@ -185,29 +187,76 @@ def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, position: int, t
         # ✅ 실질 손익 계산
         net_profit = (latest_close * (1 - fee_rate)) - (buy_price * (1 + fee_rate))
 
+        # ✅ 체결강도 확인 (급등 가능성 판단)
+        orderbook_strength = df_orderbook['buy_volume'].sum() / (df_orderbook['sell_volume'].sum() + 1e-9)
+        sell_wall_now = df_orderbook['sell_wall'].iloc[-1]
+        sell_wall_prev = df_orderbook['sell_wall'].iloc[-2]  # 이전 매도벽
+
+        sell_wall_reduction = sell_wall_now < sell_wall_prev * 0.9  # 10% 이상 감소해야 인정
+
+        # ✅ 볼린저 밴드 상단 돌파 확인
+        bb_indicator = BollingerBands(df_5m['close'], window=20)
+        bb_upper_5m = bb_indicator.bollinger_hband().iloc[-1]
+
+        # ✅ 캔들 패턴 분석 (연속 양봉 여부)
+        recent_candle_body = df_5m['close'].iloc[-1] - df_5m['open'].iloc[-1]
+        prev_candle_body = df_5m['close'].iloc[-2] - df_5m['open'].iloc[-2]
+
         logger.info(f"📊 {ticker} 매도 전략 - 손절가: {stop_loss:.2f}, 익절가: {take_profit:.2f}, 실질 손익: {net_profit:.2f}원")
 
-        # ✅ 익절 실행
-        if latest_close >= take_profit and net_profit > 0:
+        # ✅ +1% 도달 시 매도 **(단, 체결강도가 높다면 보류)**
+        if latest_close >= take_profit:
+            # 📌 체결강도가 높고 매도벽이 줄어들며 캔들 몸통이 연속 상승하는 경우 → 익절 보류
+            if (orderbook_strength > 1.5  # 체결강도 상승
+                and sell_wall_reduction  # 매도벽 감소
+                and recent_candle_body > 0  # 현재 캔들 상승
+                and prev_candle_body > 0  # 이전 캔들 상승
+                and latest_close > bb_upper_5m  # 볼린저 밴드 상단 돌파
+            ):
+                logger.info(f"🚀 {ticker} 강한 상승세 감지 → 익절 보류 (체결강도: {orderbook_strength:.2f})")
+                return {"signal": "", "message": "급등 가능성 높음 → 익절 보류"}
+
+            logger.info(f"✅ {ticker} +1% 수익 도달! 익절 실행")
             trading_context.consecutive_losses = max(0, trading_context.consecutive_losses - 2)
-            logger.info(f"✅ {ticker} 익절 발생 → 손절 횟수 2단계 감소 (현재 손절 횟수: {trading_context.consecutive_losses})")
             return {
                 "signal": "sell",
-                "message": f"익절 실행 (손절 횟수: {trading_context.consecutive_losses})",
+                "message": f"+1% 익절 (현재가: {latest_close:.2f})",
                 "stop_loss": stop_loss,
                 "take_profit": take_profit,
             }
 
-        # ✅ 손절 실행
-        if latest_close < stop_loss:
-            trading_context.consecutive_losses += 1
-            trading_context.last_sell_time = datetime.now()
-            logger.info(f"❌ {ticker} 손절 실행 (손절가: {stop_loss:.2f}원, 실제 손익: {net_profit:.2f}원)")
+        # ✅ 급락 가능성 감지 후 즉시 익절 (단, 손실일 때는 적용 안 함)
+        sell_spike = df_orderbook['sell_volume'].iloc[-5:].mean() > df_orderbook['sell_volume'].mean() * 3
+        sudden_drop = orderbook_strength < 0.7  # 📌 체결강도가 급감할 경우 포함
+        rsi_series_5m = RSIIndicator(df_5m['close'], window=14).rsi()
+        rsi_5m = rsi_series_5m.iloc[-1]  # 현재 RSI 값
+        rsi_5m_prev = rsi_series_5m.iloc[-2]  # 이전 RSI 값
+
+        rsi_5m_sudden_drop = rsi_5m < 40 and rsi_5m < rsi_5m_prev - 5
+
+        if (sell_spike or sudden_drop or rsi_5m_sudden_drop) and net_profit > buy_price * 0.001:  # 최소 0.1% 이상 수익 유지
+            logger.warning(f"🚨 {ticker} 급락 가능성 감지 → 즉시 익절")
             return {
                 "signal": "sell",
-                "message": f"손절 실행 (손절가: {stop_loss:.2f}원, 실제 손익: {net_profit:.2f}원)",
+                "message": "급락 가능성 감지 → 즉시 익절",
                 "stop_loss": stop_loss,
                 "take_profit": take_profit
             }
+
+        # ✅ **손절 시점 최적화**
+        atr_threshold = atr * 1.5  # 손절 최적화 기준
+        max_loss_allowed = max(buy_price * 0.01, atr * 2)  # 최소 1%, ATR 기준 2배
+
+        if latest_close < stop_loss:
+            if abs(latest_close - buy_price) > max_loss_allowed or abs(latest_close - buy_price) > atr_threshold:
+                trading_context.consecutive_losses += 1
+                trading_context.last_sell_time = datetime.now()
+                logger.info(f"❌ {ticker} 손절 실행 (손절가: {stop_loss:.2f}원, 실제 손익: {net_profit:.2f}원)")
+                return {
+                    "signal": "sell",
+                    "message": f"손절 실행 (손절가: {stop_loss:.2f}원, 실제 손익: {net_profit:.2f}원)",
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit
+                }
 
         return {"signal": "", "message": "매매 조건 미충족"}
