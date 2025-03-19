@@ -8,6 +8,7 @@ import numpy as np
 from urllib.parse import urlencode, unquote
 from dotenv import load_dotenv
 from datetime import datetime
+import random
 from typing import Optional
 
 
@@ -178,6 +179,7 @@ def get_open_orders(market: str) -> list:
 
     return []  # ✅ 최종적으로 3회 실패 시 빈 리스트 반환
 
+
 def cancel_old_orders(market: str, max_wait_time=30):
     """📌 미체결 주문이 일정 시간 이상 유지되면 자동 취소"""
     open_orders = get_open_orders(market)
@@ -271,7 +273,13 @@ def buy_limit(market: str, price: float, volume: float) -> dict:
     max_retries = 3  # 최대 3회 재시도
     for attempt in range(max_retries):
         try:
+            print(f"🛠 {market} 지정가 매수 요청 {attempt + 1}/{max_retries}회 시도 중...")
+            print(f"🔹 요청 파라미터: {params}")
+
             response = requests.post(BASE_URL, json=params, headers=headers)
+
+            print(f"✅ API 응답 코드: {response.status_code}")
+            print(f"✅ API 응답 데이터: {response.text}")
 
             if response.status_code == 429:  # 요청이 너무 많을 경우
                 print(f"⚠️ 요청이 너무 많음! {attempt + 1}/{max_retries}회 재시도 중...")
@@ -394,4 +402,21 @@ def get_tick_size(price):
         return round(price / 500) * 500  # 500원 단위
     else:
         return round(price / 1000) * 1000  # 1000원 단위
+
+def calculate_stop_loss_take_profit(buy_price: float, atr: float, fee_rate: float):
+    """📌 손절가(stop_loss)와 익절가(take_profit) 계산 함수"""
+
+    # ✅ 최소 손절가 설정 (매수가 대비 -2.5% 이하로 내려가지 않도록 보장)
+    min_stop_loss = buy_price * 0.975
+
+    # ✅ ATR을 활용한 변동성 기반 손절/익절 설정
+    min_atr = buy_price * 0.005
+    adjusted_atr = max(atr, min_atr)
+
+    # ✅ 트레일링 스탑 설정 (최근 최저가 반영)
+    stop_loss = max(buy_price - (adjusted_atr * 2), min_stop_loss) * (1 - fee_rate)
+    take_profit = max(buy_price * 1.05, buy_price + (adjusted_atr * 2.5))
+
+    return stop_loss, take_profit
+
 
