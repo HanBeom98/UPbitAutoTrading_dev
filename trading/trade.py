@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 from datetime import datetime
 import pandas as pd
 
+from account.my_account import get_my_exchange_account
+
 # ✅ 환경 변수 로드
 load_dotenv()
 
@@ -25,12 +27,13 @@ ORDER_STATUS_URL = "https://api.upbit.com/v1/order"  # ✅ 주문 상태 조회 
 ORDERS_CHANCE_URL = "https://api.upbit.com/v1/orders/chance"  # ✅ 최소 거래 단위 가져오기
 TICKER_URL = "https://api.upbit.com/v1/ticker"  # ✅ 현재가 조회용 URL
 
+
 def generate_auth_headers(query_params=None):
     """📌 Upbit API 호출을 위한 JWT 인증 헤더 생성"""
     if query_params is None:
         query_params = {}
 
-    query_string = unquote(urlencode(query_params, doseq=True)).encode("utf-8")
+    query_string = unquote(urlencode(query_params, doseq=True)).encode("utf-8") if query_params else b""
     query_hash = hashlib.sha512(query_string).hexdigest()
 
     payload = {
@@ -81,6 +84,14 @@ def sell_market(market: str, volume: float) -> dict:
         print(f"🚨 {market} 시장가 매도 주문 실패: volume({volume})이 유효하지 않습니다.")
         return {}
 
+    # ✅ 현재 잔고 조회 (잔고 부족 오류 방지)
+    my_balance = get_my_exchange_account()
+    available_volume = my_balance.get("assets", {}).get(market.replace("KRW-", ""), {}).get("balance", 0)
+
+    if available_volume < volume:
+        print(f"🚨 {market} 시장가 매도 주문 실패: 보유량 부족 (보유량: {available_volume}, 주문량: {volume})")
+        return {}
+
     params = {
         "market": market,
         "side": "ask",
@@ -115,7 +126,7 @@ def get_order_status(uuid: str) -> dict:
                 data = response.json()
 
                 if "trades" in data and data["trades"]:  # ✅ 체결된 거래 내역이 있을 경우
-                    executed_price = float(data["trades"][0]["price"])  # ✅ 체결 가격 가져오기
+                    executed_price = float(data.get("trades", [{}])[0].get("price", 0))  # ✅ 체결 가격 가져오기
                     return {"uuid": uuid, "price": executed_price}
 
                 print(f"⚠️ {uuid} 주문은 체결되지 않았습니다.")
@@ -299,6 +310,14 @@ def sell_limit(market: str, price: float, volume: float) -> dict:
         print(f"🚨 {market} 지정가 매도 주문 실패: price({price}), volume({volume})이 유효하지 않습니다.")
         return {}
 
+    # ✅ 현재 잔고 확인 (지정가 매도 전에 잔고 부족 오류 방지)
+    my_balance = get_my_exchange_account()
+    available_volume = float(my_balance.get("assets", {}).get(market.replace("KRW-", ""), {}).get("balance", 0) or 0)
+
+    if available_volume < volume:
+        print(f"🚨 {market} 지정가 매도 주문 실패: 보유량 부족 (보유량: {available_volume}, 주문량: {volume})")
+        return {}
+
     # ✅ 업비트 호가 단위에 맞춰 가격 조정
     adjusted_price = max(get_tick_size(price), 1)
 
@@ -407,13 +426,20 @@ def calculate_stop_loss_take_profit(buy_price: float, atr: float, fee_rate: floa
     # ✅ 최소 손절가 설정 (매수가 대비 -2.5% 이하로 내려가지 않도록 보장)
     min_stop_loss = buy_price * 0.975
 
+    # ✅ ATR 기본값 설정 (None 방지)
+    if atr is None or atr <= 0:
+        atr = buy_price * 0.005  # 최소 ATR 기본값 적용
+
     # ✅ ATR을 활용한 변동성 기반 손절/익절 설정
     min_atr = buy_price * 0.005
     adjusted_atr = max(atr, min_atr)
 
     # ✅ 트레일링 스탑 설정 (최근 최저가 반영)
-    stop_loss = max(buy_price - (adjusted_atr * 2), min_stop_loss) * (1 - fee_rate)
-    take_profit = max(buy_price * 1.05, buy_price + (adjusted_atr * 2.5))
+    stop_loss = max(buy_price - (adjusted_atr * 3), min_stop_loss) * (1 - fee_rate)
+    if buy_price is None:
+        buy_price = adjusted_atr * 3  # ATR을 기준으로 적절한 기본값 설정
+
+    take_profit = max(buy_price * 1.05, buy_price + (adjusted_atr * 3.5))
 
     return stop_loss, take_profit
 
