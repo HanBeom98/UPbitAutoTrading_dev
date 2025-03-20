@@ -12,7 +12,11 @@ def fetch_candle_data(url, params):
     """API 요청을 보내고 JSON 데이터를 반환 (실패 시 자동 재시도)"""
     response = requests.get(url, params=params, headers=headers)
     response.raise_for_status()
-    return response.json()
+    try:
+        return response.json()
+    except requests.exceptions.JSONDecodeError:
+        logger.error(f"🚨 JSON 디코딩 오류 발생 - 응답: {response.text}")
+        return []
 
 def get_min_candle_data(market: str, minutes: list):
     """
