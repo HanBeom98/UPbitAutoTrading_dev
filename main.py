@@ -1,12 +1,13 @@
 import logging
 import time
-
+from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from account.my_account import get_my_exchange_account
 from trading.trade import buy_limit, get_min_trade_volume, \
-  get_tick_size, sell_market, get_orderbook_data
-from trading.trading_strategy import trading_strategy
+  get_tick_size, sell_market, get_orderbook_data, get_order_status, buy_market, \
+  cancel_order
+from trading.trading_strategy import trading_strategy, trading_context
 from upbit_data.candle import get_min_candle_data
 
 # 🔹 로깅 설정
@@ -20,11 +21,11 @@ logger.addHandler(console_handler)
 logger.setLevel(logging.INFO)
 
 # 🔹 매매 설정
-TRADE_TICKERS = ['ETH', 'TRUMP', 'XRP', 'ADA','BTC', 'SUI']
+TRADE_TICKERS = ['ETH', 'TRUMP', 'SOL', 'VIRTUAL', 'XRP', 'ADA', 'SUI']
 INVEST_RATIO = 0.95 / len(TRADE_TICKERS)
 MAX_INVEST_AMOUNT = 400000
 MIN_ORDER_AMOUNT = 5000
-COOLDOWN_TIME = 60  # 초 단위
+COOLDOWN_TIME = 300  # 초 단위
 MAX_WAIT_TIME = 20  # ✅ 미체결 주문 자동 취소 대기 시간 (초)
 
 # 🔹 상태 저장 변수
@@ -214,13 +215,44 @@ def execute_trade():
                         logger.info(f"✅ {ticker} 지정가 매수 주문 완료 - 주문 UUID: {trade_result['uuid']}")
                         last_trade_times[ticker] = time.time()
 
-                        # ✅ 매수 후 즉시 잔고 업데이트 (투자금 반영)
-                        time.sleep(1)  # 1초 대기 후 API 조회
-                        my_balance = get_my_exchange_account()
-                        available_krw = my_balance.get("KRW", 0)
-                        position = my_balance.get("assets", {})
+                        # ✅ 지정가 체결을 기다린 후, 미체결이면 시장가 매수 실행
+                        time.sleep(2)
+                        order_status = get_order_status(trade_result["uuid"])
+
+                        if order_status and order_status.get("state") == "done":
+                            logger.info(f"✅ {ticker} 지정가 매수 체결 완료")
+                        else:
+                            logger.warning(f"⚠️ {ticker} 지정가 매수 미체결 → 시장가 매수 실행")
+                            trade_result = buy_market(f"KRW-{ticker}", invest_amount)
                     else:
                         logger.error(f"🚨 {ticker} 지정가 매수 주문 실패 - 응답 오류: {trade_result}")
+                        continue  # ✅ 지정가 매수 실패 시 바로 다음 루프로 이동
+
+                # ✅ 시장가 매수 후 평균 매수가 반영
+                if trade_result and "uuid" in trade_result:
+                    last_trade_times[ticker] = time.time()  # ✅ 매수 완료 후 시간 업데이트
+                    time.sleep(1)
+
+                    order_status = get_order_status(trade_result["uuid"])
+
+                    if order_status:
+                        avg_buy_price = get_avg_buy_price(current_balance, ticker)
+                        logger.info(f"✅ {ticker} 매수 완료! 평단: {avg_buy_price:.2f}")
+
+                        trading_context.last_buy_time[ticker] = datetime.now()
+                        trading_context.peak_price_since_buy[ticker] = avg_buy_price  # ✅ 매수 직후 최고가 초기화
+
+                    else:
+                        logger.error(f"🚨 {ticker} 지정가 매수 주문 실패 - 응답 오류: {trade_result}")
+
+                        # ✅ 미체결 주문 취소
+                        cancel_order(trade_result["uuid"])
+                        logger.info(f"❌ {ticker} 지정가 매수 주문 취소 완료")
+
+                        return  # ✅ 시장가 매수 없이 종료
+
+                else:
+                    logger.error(f"🚨 {ticker} 지정가 매수 주문 실패 - 응답 오류: {trade_result}")
 
             # ✅ 매도 로직
             elif signal == "sell":
