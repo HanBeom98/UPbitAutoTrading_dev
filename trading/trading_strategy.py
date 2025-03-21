@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import logging
 from datetime import datetime
@@ -6,7 +7,6 @@ from ta.trend import MACD, EMAIndicator, ADXIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 from ta.momentum import StochasticOscillator
-from ta.volume import OnBalanceVolumeIndicator
 
 from trading.trade import calculate_stop_loss_take_profit
 
@@ -17,6 +17,7 @@ class TradingContext:
         self.last_sell_time = {}  # ✅ 코인별 마지막 손절 시간 저장
         self.consecutive_losses = {}  # ✅ 코인별 손절 횟수 저장
         self.last_buy_time = {}  # ✅ 코인별 매수 시간 저장
+        self.peak_price_since_buy = {}  # ✅ 최고가 저장용 추가
 
     def update_loss(self, ticker: str):
         """ 특정 코인의 손절 횟수 증가 및 마지막 손절 시간 저장 """
@@ -48,6 +49,16 @@ def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_orderbook: pd
     if df_5m.empty or len(df_5m) < 200 or df_15m.empty or len(df_15m) < 100:
         return {"signal": "", "message": "데이터 부족"}
 
+    # ✅ **체결 강도 계산
+    sell_volume_sum = df_orderbook['sell_volume'].sum()
+    buy_volume_sum = df_orderbook['buy_volume'].sum()
+    orderbook_strength = buy_volume_sum / (sell_volume_sum + 1e-9)  # 🔥 체결강도 활용
+
+    orderbook_strength = orderbook_strength if not np.isnan(orderbook_strength) else 1
+
+    # ✅ 거래량 급증 여부 (체결 강도 기반으로 통합)
+    volume_spike = orderbook_strength > 1.5  # 🔥 체결 강도가 급등하면 매수 신호 강화
+
     # ✅ MACD 계산 (5분봉)
     macd_5m = MACD(df_5m['close'], window_slow=12, window_fast=26, window_sign=9)
     macd_series = macd_5m.macd()  # MACD 시리즈 캐싱
@@ -59,17 +70,52 @@ def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_orderbook: pd
     macd_5m_diff = macd_diff_series.iloc[-1]  # MACD 오실레이터
     macd_histogram = macd_5m_diff - macd_signal_series.iloc[-1]  # MACD 히스토그램
 
-    # ✅ ADX(추세 강도) 추가
+    # 🔥 MACD 히스토그램 증가 여부 체크 추가
+    if macd_5m_value > 0 and macd_5m_diff > 0:
+        logger.info(f"📈 {ticker} MACD 상승 확인 → 매수 신호 가능성 상승")
+
+    # ✅ ADX(추세 강도) 계산
     adx_5m = ADXIndicator(df_5m['high'], df_5m['low'], df_5m['close'], window=14).adx().iloc[-1]
 
-    if macd_5m_diff < 0 or macd_slope < 0 or adx_5m < 20 or macd_histogram < 0:
+    # ✅ RSI 계산 (5분봉 + 15분봉)
+    rsi_5m = RSIIndicator(df_5m['close'], window=14).rsi().fillna(50).iloc[-1]
+
+    # ✅ 볼린저 밴드 (5분봉)
+    bb_indicator = BollingerBands(df_5m['close'], window=20)
+    bb_lower_5m = bb_indicator.bollinger_lband().fillna(df_5m['close'].iloc[-1])  # NaN 방지
+
+    latest_close = df_5m['close'].iloc[-1]  # 현재 가격 선언
+
+    # ✅ Stochastic Oscillator 계산 (5분봉 기준)
+    stoch = StochasticOscillator(df_5m['high'], df_5m['low'], df_5m['close'], window=14, smooth_window=3)
+    stoch_k_series = stoch.stoch()  # 시리즈 형태 유지
+    stoch_d_series = stoch.stoch_signal()  # 시리즈 형태 유지
+
+    # ✅ 최근 값과 이전 값 가져오기
+    if len(stoch_k_series) < 2 or len(stoch_d_series) < 1:
+        logger.warning("⚠️ Stochastic Oscillator 데이터 부족으로 계산 불가")
+        return {"signal": "", "message": "스토캐스틱 데이터 부족"}
+
+    stoch_k = stoch_k_series.iloc[-1]
+    stoch_k_prev = stoch_k_series.iloc[-2]
+    stoch_d = stoch_d_series.iloc[-1]
+
+    # ✅ ADX < 20일 때 예외적으로 매수할 수 있는 조건 추가
+    allow_trade = (
+        (latest_close <= bb_lower_5m.iloc[-1] and volume_spike)  # 🔥 볼린저 밴드 반등 + 체결강도 급등
+        or (stoch_k > 20 and (stoch_k - stoch_d) > 10 and stoch_k > stoch_k_prev and volume_spike)  # 🔥 스토캐스틱 반등 + 체결강도 급등
+        or (rsi_5m < 25 and macd_5m_value > 0 and trading_context.consecutive_losses.get(ticker, 0) > 3)  # 🔥 연속 손절 후 RSI 25 이하 & MACD 상승
+        or (adx_5m > 25 and macd_5m_value > 0)  # ✅ ADX 25 이상 & MACD 상승 → 추가 매수 조건
+    )
+
+    # ✅ 기존의 "추세 미약" 조건에 예외 처리 추가
+    if (macd_5m_diff < 0 or macd_slope < 0 or macd_histogram < 0) and not allow_trade:
         return {"signal": "", "message": "추세 미약, 매매 보류"}
 
-    # 🔥 MACD 히스토그램 증가 여부 체크 추가
+    # ✅ 하락장에서 반등할 가능성 체크 (히스토그램이 증가하는 경우)
     macd_histogram_prev = macd_diff_series.iloc[-2] - macd_signal_series.iloc[-2]
     if macd_histogram > macd_histogram_prev:
-        logger.info(f"📈 {ticker} MACD 히스토그램 증가 확인 → 매수 신호 가능성 상승")
-
+        logger.info(f"📈 {ticker} MACD 히스토그램 증가 확인 → 반등 가능성 상승")
 
     # ✅ 🔥 **장기 MACD 추가 (50, 200 기준)**
     macd_long = MACD(df_5m['close'], window_slow=200, window_fast=50, window_sign=9)
@@ -82,23 +128,6 @@ def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_orderbook: pd
     # MACD가 음수에서 양수로 변하면 골든크로스 발생!
     if macd_long_histogram_prev < 0 < macd_long_histogram and macd_long_slope > 0:
         logger.info(f"🔥 {ticker} 장기 MACD 골든크로스 발생! (기울기: {macd_long_slope:.4f})")
-
-    # ✅ RSI 계산 (5분봉 + 15분봉)
-    rsi_5m = RSIIndicator(df_5m['close'], window=14).rsi().fillna(50).iloc[-1]
-
-    # ✅ 거래량 분석 (OBV 추가)
-    obv_series = OnBalanceVolumeIndicator(df_5m['close'], df_5m['volume']).on_balance_volume()
-    obv_5m = obv_series.iloc[-1]
-
-    # ✅ 거래량 급증 여부 확인
-    avg_volume_5m = df_5m['volume'].rolling(5, min_periods=1).mean().iloc[-1]
-    volume_spike = (df_5m['volume'].iloc[-1] > avg_volume_5m * 1.3) and (obv_5m > obv_series.iloc[-2])
-
-    # ✅ 볼린저 밴드 (5분봉)
-    bb_indicator = BollingerBands(df_5m['close'], window=20)
-    bb_lower_5m = bb_indicator.bollinger_lband().fillna(df_5m['close'].iloc[-1])  # NaN 방지
-
-    latest_close = df_5m['close'].iloc[-1]
 
     # 🔥 캔들 강도 추가 (양봉 개수 체크)
     bullish_candles = (df_5m['close'].iloc[-3:] > df_5m['open'].iloc[-3:]).sum()
@@ -129,9 +158,7 @@ def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_orderbook: pd
     last_sell_time = trading_context.last_sell_time.get(ticker)  # None일 경우 대비
     if last_sell_time:
         time_since_last_sell = (datetime.now() - trading_context.last_sell_time[ticker]).total_seconds()
-        atr_multiplier = max(1, min(2, atr / df_5m['close'].iloc[-1] * 100))  # 최소 1, 최대 2 배수로 제한
-        base_limit = 1800 + (trading_context.consecutive_losses.get(ticker, 0) - 3) * 600
-        limit_time = min(max(base_limit * atr_multiplier, 1800), 7200)  # 최소 30분, 최대 2시간 제한
+        limit_time = min(max(300, atr * 45), 1800)  # ✅ 최소 5분 ~ 최대 30분으로 조정
 
         if time_since_last_sell < limit_time:
             logger.warning(f"⛔ {ticker} 최근 손절 {trading_context.consecutive_losses.get(ticker, 0)}번 → {limit_time // 60}분 동안 매수 금지")
@@ -147,19 +174,6 @@ def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_orderbook: pd
         logger.warning(f"⚠️ {ticker} 손절 기록 없음 → 손절 횟수 초기화")
         trading_context.consecutive_losses[ticker] = 0  # ✅ 특정 코인만 초기화
 
-    # ✅ Stochastic Oscillator 계산 (5분봉 기준)
-    stoch = StochasticOscillator(df_5m['high'], df_5m['low'], df_5m['close'], window=14, smooth_window=3)
-    stoch_k_series = stoch.stoch()  # 시리즈 형태 유지
-    stoch_d_series = stoch.stoch_signal()  # 시리즈 형태 유지
-
-    # ✅ 최근 값과 이전 값 가져오기
-    if len(stoch_k_series) < 2 or len(stoch_d_series) < 1:
-        logger.warning("⚠️ Stochastic Oscillator 데이터 부족으로 계산 불가")
-        return {"signal": "", "message": "스토캐스틱 데이터 부족"}
-
-    stoch_k = stoch_k_series.iloc[-1]
-    stoch_k_prev = stoch_k_series.iloc[-2]
-    stoch_d = stoch_d_series.iloc[-1]
 
     if stoch_k > 20 and (stoch_k - stoch_d) > 10 and stoch_k > stoch_k_prev:
         return {"signal": "buy", "message": "스토캐스틱 과매도 반등 매수"}
@@ -167,7 +181,8 @@ def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_orderbook: pd
     # 📌 **매수 조건**
     if position == 0:
         # ✅ 매수 후 최소 5분(300초) 대기
-        if (last_buy_time := trading_context.last_buy_time.get(ticker)) and (datetime.now() - last_buy_time).total_seconds() < 300:
+        last_buy_time = trading_context.last_buy_time.get(ticker, None)
+        if isinstance(last_buy_time, datetime) and (datetime.now() - last_buy_time).total_seconds() < 300:
             logger.warning(f"⛔ {ticker} 최근 매수 후 5분 미만 경과 → 매수 금지")
             return {"signal": "", "message": "최근 매수 후 5분 미만 경과 → 매수 금지"}
 
@@ -188,41 +203,46 @@ def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_orderbook: pd
         # ✅ 손절 5번 이상이면 RSI 25 이하 & MACD 골든크로스가 발생해야만 매수 가능
         if rsi_5m < 25 and macd_5m_value > 0.1 and volume_spike:
             logger.warning(f"⛔ {ticker} 연속 손절 {trading_context.consecutive_losses.get(ticker, 0)}번 → RSI 25 이하 & MACD 골든크로스 필요")
+            trading_context.last_buy_time[ticker] = datetime.now()
+            trading_context.peak_price_since_buy[ticker] = latest_close
             return {"signal": "buy", "message": "RSI 과매도 + MACD 상승 + 거래량 급증 매수"}
 
         # ✅ 손절 7번 이상이면 거래량 급증도 필요
         if trading_context.consecutive_losses.get(ticker, 0) >= 7:
             if not volume_spike:  # ✅ 거래량 급증이 없으면 매수 금지
                 logger.warning(f"⛔ {ticker} 연속 손절 {trading_context.consecutive_losses.get(ticker, 0)}번 → 추가적으로 거래량 급증 필요")
+                trading_context.last_buy_time[ticker] = datetime.now()
+                trading_context.peak_price_since_buy[ticker] = latest_close
                 return {"signal": "", "message": "연속 손절 7번 초과 → 거래량 급증 필요"}
 
         # ✅ 최종 매수 조건 (5분봉 + 15분봉)
-        if (is_bullish and
-            macd_5m.macd().iloc[-1] > 0 and
-            rsi_5m > 50 and
-            latest_close > bb_lower_5m.iloc[-1] and volume_spike and
-            df_5m['EMA5'].iloc[-1] > df_5m['EMA15'].iloc[-1] and
-            stoch_k > stoch_d and
-            macd_long_histogram > 0):
-            logger.info(f"✅ {ticker} 상승장 매수 조건 충족")
-            trading_context.last_buy_time = datetime.now()
-            return {"signal": "buy", "message": "5분봉 + 15분봉 상승 신호"}
+        if (
+            (rsi_5m < 35 and latest_close <= bb_lower_5m.iloc[-1])  # 🔥 RSI 과매도 + 볼밴 하단 반등
+            or (orderbook_strength > 1.3 and stoch_k > stoch_d)  # 🔥 체결강도 급등 & 스토캐스틱 반등
+            or (is_bullish and df_5m['EMA5'].iloc[-1] > df_5m['EMA15'].iloc[-1] and macd_5m_value > -0.05)  # 🔥 EMA 강세 + MACD 하락 제한
+        ):
+            logger.info(f"✅ {ticker} 수정된 매수 조건 충족")
+            trading_context.last_buy_time[ticker] = datetime.now()
+            trading_context.peak_price_since_buy[ticker] = latest_close  # ✅ 매수 직후 최고가 초기화
+            return {"signal": "buy", "message": "코인 시장 최적화 매수 신호"}
 
         if is_bearish and rsi_5m < 30 and latest_close > recent_low and stoch_k < 20:
             logger.info(f"✅ {ticker} 하락장 반등 매수 신호 트리거 - RSI: {rsi_5m}, 최저가: {recent_low}, Stoch_K: {stoch_k}")
-            trading_context.last_buy_time = datetime.now()
+            trading_context.last_buy_time[ticker] = datetime.now()
+            trading_context.peak_price_since_buy[ticker] = latest_close
             return {"signal": "buy", "message": "하락장 반등 매수"}
 
-        bb_lower_5m_value = bb_lower_5m.iloc[-1] if not pd.isna(bb_lower_5m.iloc[-1]) else latest_close
-        if latest_close <= bb_lower_5m_value and rsi_5m < 35:
+        if latest_close <= bb_lower_5m.iloc[-1] and rsi_5m < 35 and volume_spike:
             logger.info(f"✅ {ticker} 볼린저 밴드 하단 반등 매수 - 현재가: {latest_close}, 볼밴 하단: {bb_lower_5m}, RSI: {rsi_5m}")
-            trading_context.last_buy_time = datetime.now()
+            trading_context.last_buy_time[ticker] = datetime.now()
+            trading_context.peak_price_since_buy[ticker] = latest_close
             return {"signal": "buy", "message": "볼린저 밴드 하단 반등 매수"}
 
         # ✅ 연속 손절 후 RSI 25 이하 & MACD 상승 골든크로스 시 강제 매수
         if trading_context.consecutive_losses.get(ticker, 0) > 3 and rsi_5m < 25 and macd_5m_value > 0:
             logger.info(f"🔥 {ticker} RSI 과매도 + MACD 골든크로스 → 강제 매수")
-            trading_context.last_buy_time = datetime.now()
+            trading_context.last_buy_time[ticker] = datetime.now()
+            trading_context.peak_price_since_buy[ticker] = latest_close
             return {"signal": "buy", "message": "RSI 과매도 + MACD 반등 강제 매수"}
 
         return {"signal": "", "message": "매수 조건 미충족"}
@@ -239,9 +259,6 @@ def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_orderbook: pd
         net_profit = (latest_close * (1 - fee_rate)) - (buy_price * (1 + fee_rate))
 
         # ✅ 체결강도 확인 (급등 가능성 판단)
-        sell_volume_sum = df_orderbook['sell_volume'].sum()
-        buy_volume_sum = df_orderbook['buy_volume'].sum()
-        orderbook_strength = buy_volume_sum / (sell_volume_sum + 1e-9)  # ✅ 0 나누기 방지
         sell_wall_now, sell_wall_prev = df_orderbook['sell_wall'].iloc[-1], df_orderbook['sell_wall'].iloc[-2]
         sell_wall_reduction = sell_wall_now < sell_wall_prev * 0.9  # 10% 이상 감소해야 인정
 
@@ -251,7 +268,16 @@ def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_orderbook: pd
 
         logger.info(f"📊 {ticker} 매도 전략 - 손절가: {stop_loss:.2f}, 익절가: {take_profit:.2f}, 실질 손익: {net_profit:.2f}원")
 
-        # ✅ +1% 도달 시 매도 **(단, 체결강도가 높다면 보류)**
+        # 🔼 보유 중이라면 최고가 업데이트
+        if ticker not in trading_context.peak_price_since_buy:
+            trading_context.peak_price_since_buy[ticker] = latest_close
+        else:
+            trading_context.peak_price_since_buy[ticker] = max(
+                trading_context.peak_price_since_buy[ticker],
+                latest_close
+            )
+
+            # ✅ +1% 도달 시 매도 **(단, 체결강도가 높다면 보류)**
         if latest_close >= take_profit:
             # 📌 체결강도가 높고 매도벽이 줄어들며 캔들 몸통이 연속 상승하는 경우 → 익절 보류
             if (orderbook_strength > 1.5  # 체결강도 상승
@@ -265,6 +291,7 @@ def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_orderbook: pd
 
             logger.info(f"✅ {ticker} +1% 수익 도달! 익절 실행")
             trading_context.consecutive_losses[ticker] = max(0, trading_context.consecutive_losses.get(ticker, 0) - 2)
+            trading_context.peak_price_since_buy.pop(ticker, None)  # ✅ 최고가 제거
             return {
                 "signal": "sell",
                 "message": f"+1% 익절 (현재가: {latest_close:.2f})",
@@ -272,9 +299,22 @@ def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_orderbook: pd
                 "take_profit": take_profit,
             }
 
+         # ✅ 트레일링 스탑 로직: 최고가 대비 1.2% 이상 하락하면 익절
+        peak_price = trading_context.peak_price_since_buy.get(ticker, latest_close)
+        if peak_price > buy_price * 1.015 and latest_close < peak_price * 0.988:
+            trading_context.consecutive_losses[ticker] = max(0, trading_context.consecutive_losses.get(ticker, 0) - 2)  # ✅ 손절 횟수 감소
+            trading_context.peak_price_since_buy.pop(ticker, None)  # ✅ 트레일링 스탑 후 최고가 제거
+            logger.warning(f"📉 {ticker} 최고가 대비 하락폭 증가 → 트레일링 스탑 익절 (최고가: {peak_price:.2f}, 현재가: {latest_close:.2f})")
+            return {
+                "signal": "sell",
+                "message": "트레일링 스탑 익절 (최고가 대비 하락)",
+                "stop_loss": stop_loss,
+                "take_profit": take_profit
+            }
+
         # ✅ 급락 가능성 감지 후 즉시 익절 (단, 손실일 때는 적용 안 함)
         sell_spike = df_orderbook['sell_volume'].iloc[-5:].mean() > df_orderbook['sell_volume'].mean() * 3 if df_orderbook['sell_volume'].mean() > 0 else False
-        sudden_drop = orderbook_strength.fillna(1) < 0.7  # NaN이면 1로 처리하여 sudden_drop = False
+        sudden_drop = orderbook_strength < 0.7  # ✅ NaN이면 이미 1로 처리했으므로 fillna() 불필요
 
         rsi_series_5m = RSIIndicator(df_5m['close'], window=14).rsi()
         rsi_5m_sudden_drop = (
@@ -283,7 +323,9 @@ def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_orderbook: pd
             and rsi_series_5m.iloc[-1] < rsi_series_5m.iloc[-2] - 5
         )
 
-        if (sell_spike or sudden_drop or rsi_5m_sudden_drop) and net_profit > buy_price * 0.001:  # 최소 0.1% 이상 수익 유지
+        if (sell_spike or sudden_drop or rsi_5m_sudden_drop) and net_profit > buy_price * 0.002:  # 최소 0.2% 이상 수익 유지
+            # ✅ 포지션 종료 → 최고가 기록 제거
+            trading_context.peak_price_since_buy.pop(ticker, None)
             logger.warning(f"🚨 {ticker} 급락 가능성 감지 → 즉시 익절")
             return {
                 "signal": "sell",
@@ -292,7 +334,25 @@ def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_orderbook: pd
                 "take_profit": take_profit
             }
 
-        # ✅ **손절 시점 최적화**
+        # ✅ 최근 15개 캔들 중 최저가 계산
+        recent_low_15 = df_5m['low'].rolling(window=15).min().iloc[-1]
+
+        # ✅ 손절 트리거 추가 (최근 15개 캔들 중 최저가 갱신 시 즉시 손절)
+        if latest_close < recent_low_15:
+            logger.warning(f"🚨 {ticker} 최근 15개 캔들 중 최저가 갱신 → 즉시 손절")
+            trading_context.update_loss(ticker)
+
+            # ✅ 손절 발생 시 최고가 기록 제거 (필수 추가!)
+            trading_context.peak_price_since_buy.pop(ticker, None)
+
+            return {
+                "signal": "sell",
+                "message": f"최근 15개 캔들 최저가 갱신 손절 (최저가: {recent_low_15:.2f})",
+                "stop_loss": stop_loss,
+                "take_profit": take_profit
+            }
+
+        # ✅ **손절 시점 최적화 (ATR 기반 손절)**
         atr = atr or (df_5m['close'].diff().abs().rolling(10).mean().iloc[-1] if len(df_5m) >= 10 else 10)
         atr_threshold, max_loss_allowed = atr * 1.5, max(buy_price * 0.01, atr * 2)
 
@@ -300,15 +360,16 @@ def trading_strategy(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_orderbook: pd
         logger.debug(f"📌 {ticker} 손절 체크 - 현재가: {latest_close}, 손절가: {stop_loss}, 손실 횟수: {trading_context.consecutive_losses}")
 
         if latest_close < stop_loss and (abs(latest_close - buy_price) > max_loss_allowed or abs(latest_close - buy_price) > atr_threshold):
-                trading_context.update_loss(ticker)
-                losses = trading_context.consecutive_losses.get(ticker, 0)
-                logger.warning(f"🚨 {ticker} 손절 발생! (손절가: {stop_loss:.2f}원, 손실횟수: {losses})")
+            trading_context.update_loss(ticker)
+            trading_context.peak_price_since_buy.pop(ticker, None)  # ✅ 손절 발생 시 최고가 제거
+            losses = trading_context.consecutive_losses.get(ticker, 0)
+            logger.warning(f"🚨 {ticker} 손절 발생! (손절가: {stop_loss:.2f}원, 손실횟수: {losses})")
 
-                return {
-                    "signal": "sell",
-                    "message": f"손절 실행 (손절가: {stop_loss:.2f}원, 실제 손익: {net_profit:.2f}원)",
-                    "stop_loss": stop_loss,
-                    "take_profit": take_profit
-                }
+            return {
+                "signal": "sell",
+                "message": f"손절 실행 (손절가: {stop_loss:.2f}원, 실제 손익: {net_profit:.2f}원)",
+                "stop_loss": stop_loss,
+                "take_profit": take_profit
+            }
 
-        return {"signal": "", "message": "매매 조건 미충족"}
+    return {"signal": "", "message": "매매 조건 미충족"}
