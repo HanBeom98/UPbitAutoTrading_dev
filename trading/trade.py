@@ -1,3 +1,5 @@
+from typing import Optional
+
 import requests
 import time
 import jwt
@@ -62,7 +64,7 @@ def validate_response(response):
 
 ### 📌 **시장가 주문 함수**
 def buy_market(market: str, price: float) -> dict:
-    """📌 시장가 매수 주문"""
+    """📌 시장가 매수 주문 + 체결 가격 확인"""
     if not market or price is None or np.isnan(price) or np.isinf(price):
         print(f"🚨 {market} 시장가 매수 주문 실패: 가격({price})이 유효하지 않습니다.")
         return {}
@@ -76,7 +78,18 @@ def buy_market(market: str, price: float) -> dict:
 
     headers = generate_auth_headers(params)
     response = requests.post(BASE_URL, json=params, headers=headers)
-    return validate_response(response)
+    result = validate_response(response)  # ✅ 먼저 응답을 받아 변수에 저장
+
+    # ✅ 평단가 계산 추가
+    if result and "uuid" in result:
+        uuid = result["uuid"]
+        check_order_status(uuid)  # 체결 대기 처리
+        avg_price = get_avg_buy_price(uuid)
+        if avg_price:
+            result["avg_buy_price"] = avg_price
+
+    return result
+
 
 def sell_market(market: str, volume: float) -> dict:
     """📌 시장가 매도 주문"""
@@ -421,25 +434,23 @@ def get_tick_size(price):
         return round(price / 1000) * 1000  # 1000원 단위
 
 def calculate_stop_loss_take_profit(buy_price: float, atr: float, fee_rate: float):
-    """📌 손절가(stop_loss)와 익절가(take_profit) 계산 함수"""
+    """📌 변동성 기반 손절가(stop_loss) 및 익절가(take_profit) 계산"""
 
-    # ✅ 최소 손절가 설정 (매수가 대비 -2.5% 이하로 내려가지 않도록 보장)
-    min_stop_loss = buy_price * 0.975
+    # ✅ 최소 손절·익절 비율 설정 (변동성이 작을 경우 빠르게 익절·손절)
+    min_stop_loss = buy_price * (1 - 0.02)  # 최소 -2% 손절
+    min_take_profit = buy_price * (1 + 0.005)  # 최소 +0.5% 익절  / +3% 익절 하고싶으면 0.03 으로 설정
 
     # ✅ ATR 기본값 설정 (None 방지)
     if atr is None or atr <= 0:
         atr = buy_price * 0.005  # 최소 ATR 기본값 적용
 
-    # ✅ ATR을 활용한 변동성 기반 손절/익절 설정
-    min_atr = buy_price * 0.005
-    adjusted_atr = max(atr, min_atr)
+    # ✅ 변동성이 작으면 빠르게 손절·익절, 변동성이 크면 넓은 손절·익절 적용
+    stop_loss = max(buy_price - (atr * 3), min_stop_loss) * (1 - fee_rate)
+    take_profit = max(buy_price + (atr * 4), min_take_profit) * (1 - fee_rate)  # ✅ 익절폭 4배로 증가
 
-    # ✅ 트레일링 스탑 설정 (최근 최저가 반영)
-    stop_loss = max(buy_price - (adjusted_atr * 3), min_stop_loss) * (1 - fee_rate)
-    if buy_price is None:
-        buy_price = adjusted_atr * 3  # ATR을 기준으로 적절한 기본값 설정
-
-    take_profit = max(buy_price * 1.05, buy_price + (adjusted_atr * 3.5))
+    # ✅ 수수료 적용
+    stop_loss *= (1 - fee_rate * 2)  # 매수 & 매도 수수료 반영
+    take_profit *= (1 - fee_rate * 2)  # 매수 & 매도 수수료 반영
 
     return stop_loss, take_profit
 
@@ -464,4 +475,21 @@ def get_orderbook_data(market: str):
     except requests.RequestException as e:
         print(f"🚨 주문장 데이터 가져오기 실패: {e}")
         return pd.DataFrame()  # 비어 있는 DataFrame 반환
+
+def get_avg_buy_price(order_uuid: str) -> Optional[float]:
+    """📌 주문 UUID를 기반으로 실제 체결된 평균 매수가 계산"""
+    order_data = get_order_status(order_uuid)
+
+    if not order_data or "trades" not in order_data or not order_data["trades"]:
+        print(f"⚠️ 체결 내역이 존재하지 않음 - UUID: {order_uuid}")
+        return None
+
+    total_volume = sum(float(trade["volume"]) for trade in order_data["trades"])
+    total_cost = sum(float(trade["price"]) * float(trade["volume"]) for trade in order_data["trades"])
+
+    if total_volume == 0:
+        print(f"⚠️ 체결된 수량이 0입니다 - UUID: {order_uuid}")
+        return None
+
+    return total_cost / total_volume  # ✅ 평단가 반환
 
