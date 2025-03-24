@@ -12,3 +12,7 @@ practice
 
 ### logs ###
 logs
+
+.env
+
+*.log
