@@ -1,14 +1,16 @@
-# export_logs.py
-
 import sqlite3
 from datetime import datetime
-
+import os  # os 모듈을 추가하여 디렉토리 확인 및 생성
 import pandas as pd
 
 DB_FILE = "trading.db"
 
 def export_logs_to_excel():
   try:
+    # 'logs' 디렉토리가 존재하는지 확인하고, 없으면 생성
+    if not os.path.exists("logs"):
+      os.makedirs("logs")
+
     with sqlite3.connect(DB_FILE) as conn:
       df = pd.read_sql_query("SELECT * FROM trade_logs", conn)
 
@@ -25,5 +27,3 @@ def export_logs_to_excel():
 
 if __name__ == "__main__":
   export_logs_to_excel()
-
-#엑셀 파일 추출 하려면 이거 실행

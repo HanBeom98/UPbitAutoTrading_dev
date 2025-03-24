@@ -1,13 +1,17 @@
-import pandas as pd
+import os
+import smtplib
 import sqlite3
+import ssl
 from datetime import datetime
-import matplotlib.pyplot as plt
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
 from email import encoders
-import smtplib, ssl, os
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+
+import matplotlib.pyplot as plt
+import pandas as pd
 from dotenv import load_dotenv
+from matplotlib import rc
 
 # 환경 변수 로드
 load_dotenv()
@@ -18,7 +22,11 @@ SENDER_EMAIL = os.getenv('SENDER_EMAIL', '')
 SENDER_PASSWORD = os.getenv('SENDER_PASSWORD', '')
 RECEIVER_EMAIL = os.getenv('RECEIVER_EMAIL', '')
 
-def send_email_with_attachment(subject, body, attachment_path):
+# 한글 폰트 설정 (Malgun Gothic 사용)
+rc('font', family='Malgun Gothic')
+
+
+def send_email_with_attachment(subject, body, attachment_paths):
     msg = MIMEMultipart()
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECEIVER_EMAIL
@@ -26,12 +34,13 @@ def send_email_with_attachment(subject, body, attachment_path):
 
     msg.attach(MIMEText(body, 'plain'))
 
-    with open(attachment_path, 'rb') as f:
-        part = MIMEBase('application', 'octet-stream')
-        part.set_payload(f.read())
-        encoders.encode_base64(part)
-        part.add_header('Content-Disposition', f'attachment; filename="{os.path.basename(attachment_path)}"')
-        msg.attach(part)
+    for attachment_path in attachment_paths:
+        with open(attachment_path, 'rb') as f:
+            part = MIMEBase('application', 'octet-stream')
+            part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header('Content-Disposition', f'attachment; filename="{os.path.basename(attachment_path)}"')
+            msg.attach(part)
 
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_SSL_PORT, context=context) as server:
@@ -84,10 +93,12 @@ def generate_daily_report():
         df.to_excel(writer, sheet_name="상세 매매 내역", index=False)
 
     print(f"✅ 리포트 저장 완료: {report_path}")
+
+    # 이메일로 엑셀 파일과 그래프 파일을 모두 첨부
     send_email_with_attachment(
         subject="📈 자동매매 일일 리포트",
         body="오늘의 리포트와 티커별 수익률 그래프를 첨부합니다.",
-        attachment_path=report_path
+        attachment_paths=[report_path, graph_path]
     )
     print("✅ 이메일 발송 완료")
 
