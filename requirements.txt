@@ -20,7 +20,13 @@ tzdata==2024.2
 tzlocal==5.2
 urllib3==1.26.15
 websockets==14.1
-numpy~=2.0.2
-websocket-client
-psycopg2
+websocket-client==1.7.0  # 최신 안정 버전 명시
+numpy==2.0.2
+psycopg2==2.9.9
 tenacity==8.2.2
+matplotlib
+sqlalchemy
+pandas
+matplotlib
+openpyxl
+python-dotenv
