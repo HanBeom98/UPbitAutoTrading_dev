@@ -1,16 +1,16 @@
-from typing import Optional
-
-import requests
-import time
-import jwt
-import uuid
 import hashlib
 import os
-import numpy as np
-from urllib.parse import urlencode, unquote
-from dotenv import load_dotenv
+import time
+import uuid
 from datetime import datetime
+from typing import Optional
+from urllib.parse import urlencode, unquote
+
+import jwt
+import numpy as np
 import pandas as pd
+import requests
+from dotenv import load_dotenv
 
 from account.my_account import get_my_exchange_account
 
@@ -118,7 +118,7 @@ def sell_market(market: str, volume: float) -> dict:
 
 ### 📌 **주문 상태 조회 (최대 3회 재시도)**
 def get_order_status(uuid: str) -> dict:
-    """📌 주문 상태 확인 후 체결된 가격 가져오기"""
+    """📌 주문 상태 확인 후 체결 여부 포함하여 반환"""
     if not uuid:
         print("🚨 주문 UUID가 제공되지 않았습니다.")
         return {}
@@ -137,13 +137,29 @@ def get_order_status(uuid: str) -> dict:
 
             if response.status_code == 200:
                 data = response.json()
+                executed_volume = float(data.get("executed_volume", 0))
+                trades = data.get("trades", [])
 
-                if "trades" in data and data["trades"]:  # ✅ 체결된 거래 내역이 있을 경우
-                    executed_price = float(data.get("trades", [{}])[0].get("price", 0))  # ✅ 체결 가격 가져오기
-                    return {"uuid": uuid, "price": executed_price}
+                executed_price = None
+                if trades and executed_volume > 0:
+                    executed_price = float(trades[0].get("price", 0))
 
-                print(f"⚠️ {uuid} 주문은 체결되지 않았습니다.")
-                return data  # ✅ 정상 응답 시 반환
+                return {
+                    "uuid": uuid,
+                    "state": data.get("state"),
+                    "executed_volume": executed_volume,
+                    "price": executed_price,
+                    "trades": trades  # ✅ 추가하면 get_avg_buy_price()에서도 사용 가능
+                }
+
+            print(f"⚠️ {uuid} 주문은 체결되지 않았습니다.")
+            return {
+                "uuid": uuid,
+                "state": "wait",
+                "executed_volume": 0,
+                "price": None,
+                "trades": []
+            }
 
         except requests.exceptions.RequestException as e:
             print(f"🚨 {uuid} 주문 상태 조회 요청 실패: {e}")
@@ -151,8 +167,7 @@ def get_order_status(uuid: str) -> dict:
     print(f"🚨 {uuid} 주문 상태 조회 3회 실패!")
     return {}
 
-
-def check_order_status(order_uuid, max_retries=5, wait_time=1):
+def check_order_status(order_uuid, max_retries=5, wait_time: float = 1.0):
     """
     ✅ 주문 상태를 최대 `max_retries`번까지 반복해서 확인하는 함수
     - max_retries: 최대 확인 횟수 (기본 5회)
@@ -361,61 +376,6 @@ def sell_limit(market: str, price: float, volume: float) -> dict:
 
     return {}  # ✅ 최종적으로 3회 실패 시 빈 딕셔너리 반환
 
-def get_current_price(market: str) -> float:
-    """📌 현재가 조회 (업비트 Ticker API)"""
-    try:
-        params = {"markets": market}
-        response = requests.get(TICKER_URL, params=params, timeout=3)
-        response.raise_for_status()
-        data = response.json()
-        return float(data[0]["trade_price"])
-    except requests.exceptions.RequestException as e:
-        print(f"🚨 현재가 조회 오류: {e}")
-        return 1.0  # ✅ None 대신 기본값 반환 (ZeroDivisionError 방지)
-
-def get_min_trade_volume(market: str) -> float:
-    """📌 최소 거래 수량 계산 (Rate Limit 처리 추가)"""
-    max_retries = 3  # 최대 3회 재시도
-    for attempt in range(max_retries):
-        try:
-            # ✅ 현재가 조회 (1.0 이상의 값이 보장됨)
-            trade_price = get_current_price(market)
-
-            # ✅ 혹시라도 1.0 미만 값이 나오면 안전한 기본값 사용
-            if trade_price <= 0:
-                print(f"⚠️ {market} 현재가 조회 실패 또는 0 이하 값 반환. 기본값 사용.")
-                return 0.01  # 기본값 설정 (API 오류 시)
-
-            # 최소 거래 금액 조회
-            params = {"market": market}
-            headers = generate_auth_headers(params)
-            response = requests.get(ORDERS_CHANCE_URL, params=params, headers=headers)
-
-            if response.status_code == 429:  # 요청이 너무 많을 경우
-                print(f"⚠️ 요청이 너무 많음! {attempt + 1}/{max_retries}회 재시도 중...")
-                time.sleep(1)  # 1초 대기 후 재시도
-                continue  # 다음 루프로 이동
-
-            response.raise_for_status()
-            data = response.json()
-
-            # ✅ KeyError 방지 및 최소 거래 금액 기본값 보장
-            min_total = float(data.get("market", {}).get("bid", {}).get("min_total", 5000.0))
-
-            # ✅ 최소 거래 금액이 0 이하라면 기본값으로 설정
-            if min_total <= 0:
-                print(f"⚠️ API 응답 이상: 최소 거래 금액이 0 이하. 기본값(5000.0) 사용")
-                min_total = 5000.0  # 기본값 설정
-
-            # 최소 거래 수량 계산
-            min_trade_volume = min_total / trade_price
-            return max(min_trade_volume, 0.01)
-
-        except requests.exceptions.RequestException as e:
-            print(f"🚨 업비트 API 오류: {e}")
-
-    return 0.01  # 기본값 설정 (API 오류 시)
-
 def get_tick_size(price):
     """📌 업비트 호가 단위에 맞춰 주문 가격 반올림"""
     if price < 2000:
@@ -477,19 +437,51 @@ def get_orderbook_data(market: str):
         return pd.DataFrame()  # 비어 있는 DataFrame 반환
 
 def get_avg_buy_price(order_uuid: str) -> Optional[float]:
-    """📌 주문 UUID를 기반으로 실제 체결된 평균 매수가 계산"""
+    """📌 UUID 기반 평균 매수가 계산 (미체결이면 None)"""
     order_data = get_order_status(order_uuid)
 
-    if not order_data or "trades" not in order_data or not order_data["trades"]:
-        print(f"⚠️ 체결 내역이 존재하지 않음 - UUID: {order_uuid}")
+    trades = order_data.get("trades", [])
+    if not trades:
+        print(f"⚠️ 체결 내역이 없거나 executed_volume == 0 → UUID: {order_uuid}")
         return None
 
-    total_volume = sum(float(trade["volume"]) for trade in order_data["trades"])
-    total_cost = sum(float(trade["price"]) * float(trade["volume"]) for trade in order_data["trades"])
+    total_volume = sum(float(trade["volume"]) for trade in trades)
+    total_cost = sum(float(trade["price"]) * float(trade["volume"]) for trade in trades)
 
     if total_volume == 0:
-        print(f"⚠️ 체결된 수량이 0입니다 - UUID: {order_uuid}")
         return None
 
-    return total_cost / total_volume  # ✅ 평단가 반환
+    return total_cost / total_volume
+
+def get_avg_buy_price_from_balance(balance_data, ticker):
+    """📌 업비트 API에서 평균 매수가(avg_buy_price)를 가져오되, 보유하지 않은 코인은 0으로 반환"""
+    asset_info = balance_data.get("assets", {}).get(ticker, {})
+
+    if not asset_info:
+        return 0  # 보유하지 않은 경우 0 반환
+
+    return float(asset_info.get("avg_buy_price", 0) or 0)  # 안전한 변환
+
+def calculate_fixed_take_profit(buy_price: float, fee_rate: float):
+    """고정 1% 익절가 계산"""
+    return buy_price * 1.01 * (1 - fee_rate * 2)
+
+def wait_for_limit_order(order_uuid, max_wait_time=10, interval=1):
+    start = time.time()
+    last_status = None
+
+    while time.time() - start < max_wait_time:
+        status = check_order_status(order_uuid, max_retries=1, wait_time=0.3)
+        if status:
+            last_status = status
+            if status.get("state") == "done":
+                print(f"✅ 지정가 체결 완료 - UUID: {order_uuid}")
+                return True, status
+        print(f"⏳ 지정가 미체결, 대기 중... ({int(time.time() - start)}초 경과)")
+        time.sleep(interval)
+
+    print(f"⛔ 지정가 체결 실패 - {max_wait_time}초 초과")
+    return False, last_status
+
+
 
