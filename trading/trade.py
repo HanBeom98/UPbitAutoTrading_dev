@@ -12,7 +12,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
-from account.my_account import get_my_exchange_account
+from account.my_account import get_my_exchange_account, get_balance
 
 # ✅ 환경 변수 로드
 load_dotenv()
@@ -482,6 +482,53 @@ def wait_for_limit_order(order_uuid, max_wait_time=10, interval=1):
 
     print(f"⛔ 지정가 체결 실패 - {max_wait_time}초 초과")
     return False, last_status
+
+def execute_sell_partial(ticker: str, sell_ratio: float):
+    balance_data = get_balance(ticker)
+    total_amount = float(balance_data.get('balance', 0))
+
+    # 💡 익절할 수량 계산
+    amount_to_sell = total_amount * sell_ratio
+
+    if amount_to_sell < 0.0001:  # 최소 주문 단위 체크 (예: BTC)
+        print(f"⚠️ {ticker} 부분 익절 수량이 너무 적어 실행 취소: {amount_to_sell:.8f}")
+        return
+
+    # 📌 지정가 or 시장가 매도 실행
+    sell_market(ticker, amount_to_sell)
+
+
+# 예: 추가 진입 시 새로운 평단가 계산
+def calculate_new_avg_buy_price(prev_price, prev_qty, new_price, new_qty):
+    total_cost = (prev_price * prev_qty) + (new_price * new_qty)
+    total_qty = prev_qty + new_qty
+    return total_cost / total_qty if total_qty > 0 else new_price
+
+def get_current_volume_ratio(ticker: str) -> float:
+    """현재 보유량 비율 계산 (0~1)"""
+    balance_data = get_balance(ticker)
+
+    # 이 부분을 명확히 추가하여 balance_data가 숫자인 경우를 방어적으로 처리
+    if isinstance(balance_data, float):
+        balance_data = {'balance': balance_data, 'avg_buy_price': 0}
+
+    total_amount = float(balance_data.get('balance', 0))
+    avg_buy_price = float(balance_data.get('avg_buy_price', 0))
+
+    krw_balance_data = get_balance("KRW")
+    if isinstance(krw_balance_data, float):
+        krw_balance = krw_balance_data
+    else:
+        krw_balance = float(krw_balance_data.get('balance', 0))
+
+    total_valuation = total_amount * avg_buy_price
+    total_allocated = total_valuation + krw_balance
+
+    return total_valuation / total_allocated if total_allocated > 0 else 0
+
+
+
+
 
 
 

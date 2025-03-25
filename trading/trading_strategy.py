@@ -8,10 +8,14 @@ from ta.momentum import RSIIndicator
 from ta.momentum import StochasticOscillator
 from ta.trend import MACD, EMAIndicator, ADXIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
+
+from account.my_account import get_my_exchange_account
+from settings import MAX_TOTAL_INVEST, MAX_INVEST_PER_TICKER_RATIO
 from utils.balance_util import get_total_balance
+from db.trade_state import load_trade_status, save_trade_status
 
 from trading.trade import calculate_stop_loss_take_profit, \
-    calculate_fixed_take_profit
+    calculate_fixed_take_profit, get_current_volume_ratio
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +30,7 @@ class TradingContext:
         self.total_start_balance = get_total_balance()  # ✅ 자산 기준점 저장
         self.realized_profit = 0.0
         self.daily_profit = 0.0
+        self.avg_buy_price = {}
 
     def update_loss(self, ticker: str):
         """ 특정 코인의 손절 횟수 증가 및 마지막 손절 시간 저장 """
@@ -40,6 +45,53 @@ class TradingContext:
         self.last_sell_time.pop(ticker, None)  # 마지막 손절 시간 삭제
 
 trading_context = TradingContext()  # 공유 인스턴스
+
+def initialize_context_for_ticker(ticker):
+    status = load_trade_status(ticker)
+    if status:
+        trading_context.consecutive_losses[ticker] = status.consecutive_losses or 0
+        trading_context.last_sell_time[ticker] = status.last_sell_time
+        trading_context.partial_sell_count[ticker] = status.partial_sell_count or 0
+        trading_context.last_partial_sell_time[ticker] = status.last_partial_sell_time
+        if status.buy_price:
+            trading_context.last_buy_time[ticker] = datetime.now()
+            trading_context.avg_buy_price[ticker] = status.buy_price
+        if hasattr(status, "peak_price") and status.peak_price:
+            trading_context.peak_price_since_buy[ticker] = status.peak_price
+        else:
+            trading_context.peak_price_since_buy[ticker] = status.buy_price  # fallback
+
+    else:
+        account_data = get_my_exchange_account()
+
+        if account_data and "assets" in account_data:
+            asset = account_data["assets"].get(ticker, None)
+            if asset:
+                balance = float(asset.get("balance", 0))
+                avg_price = float(asset.get("avg_buy_price", 0))
+
+                if balance > 0 and avg_price > 0:
+                    balance_data = {
+                        'balance': balance,
+                        'avg_buy_price': avg_price
+                    }
+
+                    trading_context.last_buy_time[ticker] = datetime.now()
+                    trading_context.peak_price_since_buy[ticker] = avg_price
+                    trading_context.avg_buy_price[ticker] = avg_price
+
+                    save_trade_status(
+                        ticker,
+                        buy_price=avg_price,
+                        partial_sell_count=0,
+                        peak_price=avg_price,
+                        balance_data=balance_data
+                    )
+                print(f"[INIT] {ticker} 초기화 완료 ({balance_data})")
+            else:
+                print(f"[INIT] {ticker}는 잔고가 없어서 저장하지 않았습니다.")
+        else:
+            print(f"[INIT] {ticker}는 보유 자산에 없습니다. DB에 저장하지 않음.")
 
 def trading_strategy(df_1m: pd.DataFrame,df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_orderbook: pd.DataFrame,
                     position: int, ticker: str,
@@ -201,24 +253,65 @@ def trading_strategy(df_1m: pd.DataFrame,df_5m: pd.DataFrame, df_15m: pd.DataFra
         logger.warning(f"⚠️ {ticker} 손절 기록 없음 → 손절 횟수 초기화")
         trading_context.consecutive_losses[ticker] = 0  # ✅ 특정 코인만 초기화
 
-
-    if stoch_k > 20 and (stoch_k - stoch_d) > 10 and stoch_k > stoch_k_prev:
-        return {"signal": "buy", "message": "스토캐스틱 과매도 반등 매수"}
-
     # 📌 **매수 조건**
+    # 또는 부분 익절 이후 비중이 0.5 미만인 경우 → 추가 매수 허용
+    current_volume_ratio = get_current_volume_ratio(ticker)  # 현재 보유 비중 (0~1)
     if position == 0:
-        # ✅ 매수 후 최소 5분(300초) 대기
+
+        # ✅ 현재 코인 투자 금액 계산
+        my_asset = get_my_exchange_account()
+        asset_data = my_asset["assets"].get(ticker)
+        balance = float(asset_data["balance"]) if asset_data else 0
+        current_investment = balance * latest_close  # 👉 실제 투자 금액 계산
+
+        # ✅ 티커별 최대 투자 허용 금액
+        max_per_ticker = MAX_TOTAL_INVEST * MAX_INVEST_PER_TICKER_RATIO
+
+        # ✅ 한도 초과 여부 판단
+        if current_investment >= max_per_ticker:
+            logger.warning(f"🚫 {ticker} 현재 투자금 {current_investment:.0f}원이 한도 {max_per_ticker:.0f}원 초과 → 추가 매수 금지")
+            return {"signal": "", "message": f"{ticker} 투자 비중 상한 초과 → 매수 금지"}
+
+        # 📌 **부분 익절 후 비중 회복 허용 (단, 급등 제한은 무시)**
+        if trading_context.partial_sell_count.get(ticker, 0) > 0 and current_volume_ratio < 1.0:
+            logger.info(f"🔁 {ticker} 부분 익절 후 비중 회복 시도 → 비중: {current_volume_ratio:.2f}")
+
+            investment_ratio = 0.1  # ✅ 추가 매수는 항상 10% 고정
+            logger.info(f"📌 {ticker} 추가 매수 비중 고정: {investment_ratio * 100:.0f}%")
+
+            trading_context.last_buy_time[ticker] = datetime.now()
+            trading_context.peak_price_since_buy[ticker] = latest_close
+            save_trade_status(
+                ticker,
+                buy_price=latest_close,
+                partial_sell_count=0,
+                peak_price=latest_close
+            )
+            return {
+                "signal": "buy",
+                "message": f"부분 익절 후 추가 매수 10% (현재가: {latest_close:.2f})"
+            }
+        else:
+            price_change_5m = df_5m['close'].iloc[-1] / df_5m['close'].iloc[-6] - 1
+            if price_change_5m > 0.05:
+                logger.warning(f"🚫 {ticker} 최근 5분간 5% 이상 급등 → 매수 보류")
+                return {"signal": "", "message": "급등 이후 진입 제한"}
+
+
+        cooldown_time = min(max(120, atr * 25), 600)  # 최소 2분 ~ 최대 10분
         last_buy_time = trading_context.last_buy_time.get(ticker, None)
-        if isinstance(last_buy_time, datetime) and (datetime.now() - last_buy_time).total_seconds() < 300:
-            logger.warning(f"⛔ {ticker} 최근 매수 후 5분 미만 경과 → 매수 금지")
-            return {"signal": "", "message": "최근 매수 후 5분 미만 경과 → 매수 금지"}
+        if isinstance(last_buy_time, datetime) and (datetime.now() - last_buy_time).total_seconds() < cooldown_time:
+            logger.warning(f"⛔ {ticker} 최근 매수 후 {cooldown_time:.0f}초 미만 경과 → 매수 금지")
+            return {"signal": "", "message": f"최근 매수 후 {cooldown_time // 60:.0f}분 이내 → 매수 금지"}
 
         # 🔥 동일 가격대에서 매수 반복 방지 (단, 1.5% 이상 조정되면 가능)
         if buy_price is None:
             buy_price = latest_close  # 기본값으로 현재가를 사용
 
-        # ✅ 재매수 제한 조건: 손절 기록이 없고 이전 매수가격(buy_price)이 존재할 경우에만 체크
-        if ticker not in trading_context.last_sell_time and buy_price and latest_close > buy_price * 0.985:
+        is_partial_reentry = trading_context.partial_sell_count.get(ticker, 0) > 0 and current_volume_ratio < 1.0
+
+        # ✅ 재매수 제한 조건: 손절 기록 없고, 이전 매수가 있고, 부분 익절 후 재진입이 아닌 경우
+        if ticker not in trading_context.last_sell_time and buy_price and not is_partial_reentry:
             # ✅ 기본적으로 1.5% 이상 하락해야 매수 가능
             if (latest_close - buy_price) / buy_price < -0.015:
                 # 🔥 추가적인 강한 매수 신호가 있으면 매수 허용
@@ -229,6 +322,12 @@ def trading_strategy(df_1m: pd.DataFrame,df_5m: pd.DataFrame, df_15m: pd.DataFra
                 f"(현재가: {latest_close:.2f}, 평단가: {buy_price:.2f})"
             )
             return {"signal": "", "message": "평단가 대비 1.5% 미만 하락 → 매수 보류"}
+        # ✅ 부분 익절 후 재진입일 경우에도 +1% 초과 시 보류
+        if is_partial_reentry and latest_close > buy_price * 1.01:
+            logger.warning(
+                f"⛔ {ticker} 부분 익절 후 재매수 시도 → 평단가보다 1% 이상 비쌈 → 매수 보류 "
+                f"(현재가: {latest_close:.2f}, 평단가: {buy_price:.2f})"
+            )
 
         trading_context.partial_sell_count[ticker] = 0
 
@@ -241,6 +340,12 @@ def trading_strategy(df_1m: pd.DataFrame,df_5m: pd.DataFrame, df_15m: pd.DataFra
             logger.warning(f"⛔ {ticker} 연속 손절 {trading_context.consecutive_losses.get(ticker, 0)}번 → RSI 25 이하 & MACD 골든크로스 필요")
             trading_context.last_buy_time[ticker] = datetime.now()
             trading_context.peak_price_since_buy[ticker] = latest_close
+            save_trade_status(
+                ticker,
+                buy_price=latest_close,
+                partial_sell_count=0,
+                peak_price=latest_close
+            )
             return {"signal": "buy", "message": "RSI 과매도 + MACD 상승 + 거래량 급증 매수"}
 
         # ✅ 손절 7번 이상이면 거래량 급증도 필요
@@ -249,7 +354,27 @@ def trading_strategy(df_1m: pd.DataFrame,df_5m: pd.DataFrame, df_15m: pd.DataFra
                 logger.warning(f"⛔ {ticker} 연속 손절 {trading_context.consecutive_losses.get(ticker, 0)}번 → 추가적으로 거래량 급증 필요")
                 trading_context.last_buy_time[ticker] = datetime.now()
                 trading_context.peak_price_since_buy[ticker] = latest_close
+                save_trade_status(
+                    ticker,
+                    buy_price=latest_close,
+                    partial_sell_count=0,
+                    peak_price=latest_close
+                )
                 return {"signal": "", "message": "연속 손절 7번 초과 → 거래량 급증 필요"}
+
+        # ✅ 연속 손절 후 RSI 25 이하 & MACD 상승 골든크로스 시 강제 매수
+        if trading_context.consecutive_losses.get(ticker, 0) > 3 and rsi_5m < 25 and macd_5m_value > 0:
+            logger.info(f"🔥 {ticker} RSI 과매도 + MACD 골든크로스 → 강제 매수")
+            trading_context.last_buy_time[ticker] = datetime.now()
+            trading_context.peak_price_since_buy[ticker] = latest_close
+            save_trade_status(
+                ticker,
+                buy_price=latest_close,
+                partial_sell_count=0,
+                peak_price=latest_close
+            )
+            return {"signal": "buy", "message": "RSI 과매도 + MACD 반등 강제 매수"}
+
 
         # ✅ 천천히 반등하는 저점 매수 전략 (볼밴 하단 + 약한 체결강도)
         if (
@@ -261,7 +386,25 @@ def trading_strategy(df_1m: pd.DataFrame,df_5m: pd.DataFrame, df_15m: pd.DataFra
             logger.info(f"✅ {ticker} 천천히 반등하는 저점 매수 조건 충족")
             trading_context.last_buy_time[ticker] = datetime.now()
             trading_context.peak_price_since_buy[ticker] = latest_close
+            save_trade_status(
+                ticker,
+                buy_price=latest_close,
+                partial_sell_count=0,
+                peak_price=latest_close
+            )
             return {"signal": "buy", "message": "📉 천천히 반등하는 저점 매수 조건 충족"}
+
+        if latest_close <= bb_lower_5m.iloc[-1] and rsi_5m < 35 and volume_spike:
+            logger.info(f"✅ {ticker} 볼린저 밴드 하단 반등 매수 - 현재가: {latest_close}, 볼밴 하단: {bb_lower_5m}, RSI: {rsi_5m}")
+            trading_context.last_buy_time[ticker] = datetime.now()
+            trading_context.peak_price_since_buy[ticker] = latest_close
+            save_trade_status(
+                ticker,
+                buy_price=latest_close,
+                partial_sell_count=0,
+                peak_price=latest_close
+            )
+            return {"signal": "buy", "message": "볼린저 밴드 하단 반등 매수"}
 
         # ✅ 최종 매수 조건 (5분봉 + 15분봉)
         if (
@@ -272,33 +415,50 @@ def trading_strategy(df_1m: pd.DataFrame,df_5m: pd.DataFrame, df_15m: pd.DataFra
             logger.info(f"✅ {ticker} 수정된 매수 조건 충족")
             trading_context.last_buy_time[ticker] = datetime.now()
             trading_context.peak_price_since_buy[ticker] = latest_close  # ✅ 매수 직후 최고가 초기화
-            return {"signal": "buy", "message": "코인 시장 최적화 매수 신호"}
+            save_trade_status(
+                ticker,
+                buy_price=latest_close,
+                partial_sell_count=0,
+                peak_price=latest_close
+            )
+            return {"signal": "buy", "message": "✅ 복합 매수 조건 충족 → 강력한 상승 시그널 포착"}
+
+        # ✅ 스토캐스틱 반등 매수 조건
+        if stoch_k > 20 and (stoch_k - stoch_d) > 10 and stoch_k > stoch_k_prev and volume_spike:
+            logger.info(f"✅ {ticker} 스토캐스틱 반등 매수 조건 충족")
+            trading_context.last_buy_time[ticker] = datetime.now()
+            trading_context.peak_price_since_buy[ticker] = latest_close
+            save_trade_status(
+                ticker,
+                buy_price=latest_close,
+                partial_sell_count=0,
+                peak_price=latest_close
+            )
+            return {"signal": "buy", "message": "스토캐스틱 과매도 반등 매수"}
 
         if is_bearish and rsi_5m < 30 and latest_close > recent_low and stoch_k < 20:
             logger.info(f"✅ {ticker} 하락장 반등 매수 신호 트리거 - RSI: {rsi_5m}, 최저가: {recent_low}, Stoch_K: {stoch_k}")
             trading_context.last_buy_time[ticker] = datetime.now()
             trading_context.peak_price_since_buy[ticker] = latest_close
+            save_trade_status(
+                ticker,
+                buy_price=latest_close,
+                partial_sell_count=0,
+                peak_price=latest_close
+            )
             return {"signal": "buy", "message": "하락장 반등 매수"}
-
-        if latest_close <= bb_lower_5m.iloc[-1] and rsi_5m < 35 and volume_spike:
-            logger.info(f"✅ {ticker} 볼린저 밴드 하단 반등 매수 - 현재가: {latest_close}, 볼밴 하단: {bb_lower_5m}, RSI: {rsi_5m}")
-            trading_context.last_buy_time[ticker] = datetime.now()
-            trading_context.peak_price_since_buy[ticker] = latest_close
-            return {"signal": "buy", "message": "볼린저 밴드 하단 반등 매수"}
-
-        # ✅ 연속 손절 후 RSI 25 이하 & MACD 상승 골든크로스 시 강제 매수
-        if trading_context.consecutive_losses.get(ticker, 0) > 3 and rsi_5m < 25 and macd_5m_value > 0:
-            logger.info(f"🔥 {ticker} RSI 과매도 + MACD 골든크로스 → 강제 매수")
-            trading_context.last_buy_time[ticker] = datetime.now()
-            trading_context.peak_price_since_buy[ticker] = latest_close
-            return {"signal": "buy", "message": "RSI 과매도 + MACD 반등 강제 매수"}
-
-        return {"signal": "", "message": "매수 조건 미충족"}
 
     # 📌 **매도 조건**
     if position == 1 and buy_price is not None:
         latest_close = df_5m['close'].iloc[-1] if not df_5m.empty else 0
         buy_price = buy_price if buy_price is not None else latest_close
+
+        # ✅ 최고가 실시간 갱신 + DB 저장
+        prev_peak = trading_context.peak_price_since_buy.get(ticker, 0)
+        new_peak = max(prev_peak, latest_close)
+        if new_peak > prev_peak:
+            trading_context.peak_price_since_buy[ticker] = new_peak
+            save_trade_status(ticker, peak_price=new_peak)
 
         # ✅ 손절 및 익절 가격 계산
         stop_loss, take_profit = calculate_stop_loss_take_profit(buy_price, atr, fee_rate)
@@ -319,46 +479,6 @@ def trading_strategy(df_1m: pd.DataFrame,df_5m: pd.DataFrame, df_15m: pd.DataFra
 
         logger.info(f"📊 {ticker} 매도 전략 - 손절가: {stop_loss:.2f}, 익절가: {take_profit:.2f}, 실질 손익: {net_profit:.2f}원")
 
-        # 🔼 보유 중이라면 최고가 업데이트
-        if trading_context.peak_price_since_buy.get(ticker) is not None:
-            trading_context.peak_price_since_buy[ticker] = max(trading_context.peak_price_since_buy[ticker], latest_close)
-        else:
-            trading_context.peak_price_since_buy[ticker] = latest_close  # ✅ 최초 할당
-
-        # ✅ +1% 도달 시 부분 익절
-        if latest_close >= fixed_take_profit:
-            logger.info(f"📊 {ticker} 현재가: {latest_close}, 평단가: {buy_price}, 익절가: {fixed_take_profit}")
-
-            partial_sell_time = trading_context.last_partial_sell_time.get(ticker)
-            if partial_sell_time and (datetime.now() - partial_sell_time).total_seconds() < 180:
-                logger.info(f"⏸️ {ticker} 부분 익절 쿨다운 중 → 중복 부분 익절 보류")
-                return {"signal": "", "message": "부분 익절 쿨다운 중 → 중복 익절 보류"}
-
-            # ✅ 부분 익절 2회 이상이면 추가 익절 보류
-            if trading_context.partial_sell_count.get(ticker, 0) >= 2:
-                logger.info(f"⏸️ {ticker} 이미 2회 부분 익절 → 추가 익절 보류")
-                return {"signal": "", "message": "부분 익절 2회 초과 → 기다림"}
-
-            trading_context.partial_sell_count[ticker] = trading_context.partial_sell_count.get(ticker, 0) + 1
-
-            # ✅ 손절 횟수 감소
-            trading_context.consecutive_losses[ticker] = max(0, trading_context.consecutive_losses.get(ticker, 0) - 2)
-
-            trading_context.last_partial_sell_time[ticker] = datetime.now()
-
-            # ✅ 일부 익절 (50% 매도)
-            return {
-                "signal": "sell_partial",  # 🔥 일부 익절
-                "message": f"+1% 부분 익절 (현재가: {latest_close:.2f})",
-                "stop_loss": stop_loss,
-                "take_profit": fixed_take_profit,
-            }
-
-        # ✅ 3분 쿨다운: 부분 익절 후 180초 동안 전체 매도 방지
-        partial_sell_time = trading_context.last_partial_sell_time.get(ticker)
-        if partial_sell_time and (datetime.now() - partial_sell_time).total_seconds() < 180:
-            logger.info(f"⏸️ {ticker} 부분 익절 후 3분 쿨다운 중 → 트레일링 스탑 매도 보류")
-            return {"signal": "", "message": "부분 익절 후 쿨다운 → 트레일링 스탑 보류"}
 
         # ✅ 트레일링 스탑 로직: 최고가 대비 1.2% 이상 하락하면 익절
         peak_price = trading_context.peak_price_since_buy.get(ticker, latest_close)
@@ -366,15 +486,128 @@ def trading_strategy(df_1m: pd.DataFrame,df_5m: pd.DataFrame, df_15m: pd.DataFra
         # 🔥 [추가] 트레일링 스탑 적용 전에 손익 계산 (익절인지 확인)
         expected_profit = (latest_close * (1 - fee_rate)) - (buy_price * (1 + fee_rate))
 
+        # ✅ 최근 15개 캔들 중 최저가 계산 후 손절
+        recent_low_15 = df_5m['low'].rolling(window=15).min().iloc[-1]
+
+        # ✅ 손절 트리거 추가 (최근 15개 캔들 중 최저가 갱신 시 즉시 손절)
+        if latest_close < recent_low_15 * 0.99:
+            logger.warning(f"🚨 {ticker} 최근 15개 캔들 최저가 {recent_low_15:.4f} 대비 1% 추가 하락 → 현재가: {latest_close:.4f} → 손절 실행")
+            trading_context.update_loss(ticker)
+            trading_context.last_partial_sell_time.pop(ticker, None)
+            trading_context.peak_price_since_buy.pop(ticker, None)
+            save_trade_status(
+                ticker,
+                consecutive_losses=trading_context.consecutive_losses.get(ticker, 0),
+                last_sell_time=trading_context.last_sell_time.get(ticker)
+            )
+            return {
+                "signal": "sell",
+                "message": f"최근 15개 캔들 최저가 갱신 손절 (최저가: {recent_low_15:.2f})",
+                "stop_loss": stop_loss,
+                "take_profit": take_profit
+            }
+
+        # ✅ +1% 도달 시 부분 익절
+        if latest_close >= fixed_take_profit:
+            logger.info(f"📊 {ticker} 현재가: {latest_close}, 평단가: {buy_price}, 익절가: {fixed_take_profit}")
+
+            print(f"[DEBUG] {ticker} 현재가: {latest_close} / 익절가: {fixed_take_profit}")
+
+            partial_sell_time = trading_context.last_partial_sell_time.get(ticker)
+            if partial_sell_time and (datetime.now() - partial_sell_time).total_seconds() < 180:
+                logger.info(f"⏸️ {ticker} 부분 익절 쿨다운 중 → 중복 부분 익절 보류")
+                return {"signal": "", "message": "부분 익절 쿨다운 중 → 중복 익절 보류"}
+
+            if partial_sell_time:
+                print(f"[DEBUG] 쿨다운 체크 → 마지막 익절 시각: {partial_sell_time}, 경과 시간: {(datetime.now() - partial_sell_time).total_seconds()}")
+
+            # ✅ 익절 횟수에 따라 익절 비중 점진 감소
+            def get_partial_sell_ratio(count: int) -> float:
+                if count == 0:
+                    return 0.5
+                elif count == 1:
+                    return 0.3
+                elif count == 2:
+                    return 0.2
+                else:
+                    return 0.1  # 3회 이상은 10%
+
+            partial_count = trading_context.partial_sell_count.get(ticker, 0)
+            sell_ratio = get_partial_sell_ratio(partial_count)
+
+            # 🔥 여기서 최소 금액 확인 후 전량 매도 처리
+            my_asset = get_my_exchange_account()
+            asset_data = my_asset["assets"].get(ticker)
+
+            if asset_data is None:
+                logger.warning(f"🚫 {ticker} 잔고 정보 없음 → 전략 종료")
+                return {"signal": "", "message": f"{ticker} 잔고 없음 → 전략 종료"}
+
+            balance = float(asset_data["balance"])
+            if latest_close * balance * sell_ratio < 6000:
+                if latest_close * balance < 6000:
+                    logger.warning(f"💸 {ticker} 소액 잔여 → 전량 매도 처리 및 상태 초기화")
+
+                    # ✅ 상태 초기화
+                    trading_context.partial_sell_count.pop(ticker, None)
+                    trading_context.peak_price_since_buy.pop(ticker, None)
+                    trading_context.last_partial_sell_time.pop(ticker, None)
+                    trading_context.avg_buy_price.pop(ticker, None)
+
+                    # ✅ DB 초기화
+                    save_trade_status(
+                        ticker,
+                        buy_price=None,
+                        peak_price=None,
+                        partial_sell_count=0,
+                        last_partial_sell_time=None
+                    )
+
+                    return {
+                        "signal": "sell",
+                        "message": "최소 주문 기준 이하 → 전량 매도",
+                        "stop_loss": stop_loss,
+                        "take_profit": take_profit
+                    }
+                else:
+                    return {
+                        "signal": "",  # 부분 익절 보류
+                        "message": "부분 매도 금액 최소 기준 미달 → 보류"
+                    }
+
+            # ✅ 부분 익절 횟수 증가
+            trading_context.partial_sell_count[ticker] = partial_count + 1
+            # ✅ 손절 횟수 감소
+            trading_context.consecutive_losses[ticker] = max(0, trading_context.consecutive_losses.get(ticker, 0) - 2)
+            trading_context.last_partial_sell_time[ticker] = datetime.now()
+            # ✅ DB 저장
+            save_trade_status(
+                ticker,
+                partial_sell_count=trading_context.partial_sell_count[ticker],
+                last_partial_sell_time=trading_context.last_partial_sell_time[ticker]
+            )
+
+            return {
+                "signal": "sell_partial",  # 🔥 일부 익절
+                "message": f"+1% 부분 익절 {sell_ratio * 100:.0f}% (현재가: {latest_close:.2f})",
+                "stop_loss": stop_loss,
+                "take_profit": fixed_take_profit,
+                "sell_ratio": sell_ratio  # 💡 매도 요청 시 이 비율 적용 필요
+            }
+
         # 🔥 [수정] 손실이 발생할 경우 트레일링 스탑 실행 안 함
         if peak_price > buy_price * 1.015 and latest_close < peak_price * 0.988:
             if expected_profit > 0:  # ✅ 트레일링 스탑 시 수익이 날 경우에만 실행
+                profit = (latest_close - buy_price) * (1 - fee_rate)
+                trading_context.realized_profit += profit
+                logger.info(f"💰 [트레일링 스탑] 실현 수익: {profit:.2f}원 | 누적: {trading_context.realized_profit:.2f}원")
+
                 trading_context.last_partial_sell_time.pop(ticker, None)
                 trading_context.consecutive_losses[ticker] = max(0, trading_context.consecutive_losses.get(ticker, 0) - 2)  # ✅ 손절 횟수 감소
                 trading_context.peak_price_since_buy.pop(ticker, None)  # ✅ 트레일링 스탑 후 최고가 제거
                 trading_context.partial_sell_count.pop(ticker, None)
-                logger.warning(f"📉 {ticker} 최고가 대비 하락폭 증가 → 트레일링 스탑 익절 (최고가: {peak_price:.2f}, 현재가: {latest_close:.2f})")
 
+                logger.warning(f"📉 {ticker} 트레일링 스탑 익절 (최고가: {peak_price:.2f}, 현재가: {latest_close:.2f})")
                 return {
                     "signal": "sell",
                     "message": "트레일링 스탑 익절 (최고가 대비 하락)",
@@ -384,11 +617,13 @@ def trading_strategy(df_1m: pd.DataFrame,df_5m: pd.DataFrame, df_15m: pd.DataFra
             else:
                 logger.warning(f"⚠️ {ticker} 트레일링 스탑 조건 충족 BUT 손실 발생 가능 → 매도 보류")
 
-        # ✅ 5분봉 급락 감지 (누락된 sell_spike & sudden_drop 추가)
-        sell_spike = df_orderbook['sell_volume'].iloc[-5:].mean() > df_orderbook['sell_volume'].mean() * 3 if df_orderbook['sell_volume'].mean() > 0 else False
-        sudden_drop = orderbook_strength < 0.7  # ✅ NaN이면 이미 1로 처리했으므로 fillna() 불필요
+        # ✅ 3분 쿨다운: 부분 익절 후 180초 동안 전체 매도 방지
+        partial_sell_time = trading_context.last_partial_sell_time.get(ticker)
+        if partial_sell_time and (datetime.now() - partial_sell_time).total_seconds() < 180:
+            logger.info(f"⏸️ {ticker} 부분 익절 후 3분 쿨다운 중 → 트레일링 스탑 매도 보류")
+            return {"signal": "", "message": "부분 익절 후 쿨다운 → 트레일링 스탑 보류"}
 
-        # ✅ 1분봉 급락 감지 (단기 변동 감지)
+         # ✅ 1분봉 급락 감지 (단기 변동 감지)
         if (rsi_1m_drop or is_breaking_1m_support) and net_profit > buy_price * 0.001:
             logger.warning(f"🚨 {ticker} 1분봉 급락 신호 → 부분 익절 (50%)")
 
@@ -400,7 +635,16 @@ def trading_strategy(df_1m: pd.DataFrame,df_5m: pd.DataFrame, df_15m: pd.DataFra
                 "take_profit": take_profit,
             }
 
+        # ✅ 5분봉 급락 감지 (누락된 sell_spike & sudden_drop 추가)
+        sell_spike = df_orderbook['sell_volume'].iloc[-5:].mean() > df_orderbook['sell_volume'].mean() * 3 if df_orderbook['sell_volume'].mean() > 0 else False
+        sudden_drop = orderbook_strength < 0.6  # ✅ NaN이면 이미 1로 처리했으므로 fillna() 불필요
+
         # ✅ 5분봉 급락 감지 (지속적인 하락 감지)
+        if rsi_1m_drop or is_breaking_1m_support:
+            if df_1m['close'].iloc[-1] > df_1m['open'].iloc[-1]:
+                logger.info(f"✅ {ticker} 1분봉 급락 이후 양봉 → 매도 보류")
+                return {"signal": "", "message": "급락 이후 반등 조짐 → 대기"}
+
         if (sell_spike or sudden_drop) and net_profit > buy_price * 0.002:
             logger.warning(f"🚨 {ticker} 5분봉 급락 신호 → 전체 포지션 청산")
             trading_context.partial_sell_count.pop(ticker, None)
@@ -411,24 +655,6 @@ def trading_strategy(df_1m: pd.DataFrame,df_5m: pd.DataFrame, df_15m: pd.DataFra
                 "stop_loss": stop_loss,
                 "take_profit": take_profit
             }
-
-        # ✅ 최근 15개 캔들 중 최저가 계산 후 손절
-        recent_low_15 = df_5m['low'].rolling(window=15).min().iloc[-1]
-
-        # ✅ 손절 트리거 추가 (최근 15개 캔들 중 최저가 갱신 시 즉시 손절)
-        if latest_close < recent_low_15 * 0.99:
-            logger.warning(f"🚨 {ticker} 최근 15개 캔들 최저가 {recent_low_15:.4f} 대비 1% 추가 하락 → 현재가: {latest_close:.4f} → 손절 실행")
-            trading_context.update_loss(ticker)
-            trading_context.last_partial_sell_time.pop(ticker, None)
-            trading_context.peak_price_since_buy.pop(ticker, None)
-            return {
-                "signal": "sell",
-                "message": f"최근 15개 캔들 최저가 갱신 손절 (최저가: {recent_low_15:.2f})",
-                "stop_loss": stop_loss,
-                "take_profit": take_profit
-            }
-
-        trading_context.last_partial_sell_time.pop(ticker, None)
 
         # ✅ **손절 시점 최적화 (ATR 기반 손절)**
         atr = atr or (df_5m['close'].diff().abs().rolling(10).mean().iloc[-1] if len(df_5m) >= 10 else 10)
@@ -443,6 +669,11 @@ def trading_strategy(df_1m: pd.DataFrame,df_5m: pd.DataFrame, df_15m: pd.DataFra
             trading_context.last_partial_sell_time.pop(ticker, None)
             losses = trading_context.consecutive_losses.get(ticker, 0)
             logger.warning(f"🚨 {ticker} 손절 발생! (손절가: {stop_loss:.2f}원, 손실횟수: {losses})")
+            save_trade_status(
+                ticker,
+                consecutive_losses=trading_context.consecutive_losses.get(ticker, 0),
+                last_sell_time=trading_context.last_sell_time.get(ticker)
+            )
 
             return {
                 "signal": "sell",
@@ -468,6 +699,10 @@ def update_realized_profit(order_uuid: str, avg_buy_price: float):
 
     profit = (avg_sell_price - avg_buy_price) * total_volume
     trading_context.realized_profit += profit
+    trading_context.daily_profit += profit
 
-    print(f"📈 실현 수익 업데이트: +{profit:,.0f}원 | 누적 수익: {trading_context.realized_profit:,.0f}원")
-    print(f"📊 기준 자산 대비 수익률: {trading_context.realized_profit / trading_context.total_start_balance * 100:.2f}%")
+    print(f"📈 실현 수익 업데이트: +{profit:,.0f}원 | 누적 실현 수익: {trading_context.realized_profit:,.0f}원")
+    current_total_balance = get_total_balance()
+    total_profit = current_total_balance - trading_context.total_start_balance
+    profit_rate = (total_profit / trading_context.total_start_balance) * 100
+    print(f"📊 평가 기준 수익률: {profit_rate:.2f}% (현재 자산: {current_total_balance:,.0f}원)")

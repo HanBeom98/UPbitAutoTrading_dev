@@ -101,4 +101,4 @@ def run_backtest(ticker: str, market: str = "KRW-", fee_rate: float = 0.0005):
 
 # 👉 실행
 if __name__ == "__main__":
-    run_backtest("AVAX")
+    run_backtest("ATOM")

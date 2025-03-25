@@ -17,16 +17,19 @@ def get_total_balance(account_data=None) -> float:
   if not account_data or "assets" not in account_data:
     return total_balance
 
+  # ✅ 현금(KRW) 포함 (여기서만 추가)
+  total_balance += float(account_data.get("KRW", 0))
+
   for symbol, info in account_data["assets"].items():
-    balance = float(info.get("balance", 0))
     if symbol == "KRW":
-      total_balance += balance
-    else:
-      market = f"KRW-{symbol}"
-      current_price = get_current_price(market)
-      total_balance += balance * current_price
+      continue  # 현금은 이미 추가했으므로 패스
+    balance = float(info.get("balance", 0))
+    market = f"KRW-{symbol}"
+    current_price = get_current_price(market)
+    total_balance += balance * current_price
 
   return total_balance
+
 
 def get_current_price(market: str) -> float:
   """📌 현재가 조회 (업비트 Ticker API)"""
@@ -82,3 +85,15 @@ def get_min_trade_volume(market: str) -> float:
       print(f"🚨 업비트 API 오류: {e}")
 
   return 0.01  # 기본값 설정 (API 오류 시)
+
+def get_krw_balance(account_data=None) -> float:
+  """💰 보유 현금(KRW)만 조회"""
+  if account_data is None:
+    account_data = get_my_exchange_account()
+
+  if not account_data or "assets" not in account_data:
+    return 0.0
+
+  return float(account_data["assets"].get("KRW", {}).get("balance", 0))
+
+

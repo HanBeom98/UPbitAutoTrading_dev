@@ -4,13 +4,14 @@ import logging
 import time
 from threading import Lock
 
+from db.trade_state import save_trade_status
 from trading.trade import buy_limit, sell_market, get_orderbook_data, \
   get_avg_buy_price_from_balance, cancel_order, \
-  buy_market, get_tick_size, wait_for_limit_order, get_order_status
+  buy_market, get_tick_size, wait_for_limit_order, get_order_status, calculate_new_avg_buy_price, get_avg_buy_price
 from trading.trading_strategy import trading_strategy, trading_context, \
   update_realized_profit
 from account.my_account import get_my_exchange_account
-from settings import TRADE_TICKERS, MAX_TOTAL_INVEST, MAX_INVEST_AMOUNT, MIN_ORDER_AMOUNT, COOLDOWN_TIME
+from settings import TRADE_TICKERS, MAX_TOTAL_INVEST, MAX_INVEST_AMOUNT, MIN_ORDER_AMOUNT
 from db.strategy_logger import log_trade_result
 from utils.balance_util import get_total_balance, get_min_trade_volume
 
@@ -38,7 +39,7 @@ if account_data and "assets" in account_data:
       avg_price = float(asset.get("avg_buy_price", 0))
       if balance > 0:
         position[ticker] = {"balance": balance, "avg_buy_price": avg_price}
-        last_trade_times[ticker] = time.time() - COOLDOWN_TIME
+        #last_trade_times[ticker] = time.time() - COOLDOWN_TIME
         highest_prices[ticker] = avg_price
 
 
@@ -56,7 +57,7 @@ def get_investment_amount(available_krw, current_position, ticker):
     return 0
 
   total_invest_limit = min(available_krw, MAX_TOTAL_INVEST)
-  invest_amount = total_invest_limit / remaining_tickers
+  invest_amount = total_invest_limit / len(TRADE_TICKERS)
   invest_amount = min(invest_amount, MAX_INVEST_AMOUNT)
 
   logger.info(f"📊 {ticker} 투자 금액: {invest_amount}원")
@@ -111,11 +112,11 @@ def process_ticker(ticker, current_balance, available_krw):
 
     message = result.get("message", "")
     stop_loss = result.get("stop_loss", None)
-    last_trade_time = last_trade_times.get(ticker, 0)
+    #last_trade_time = last_trade_times.get(ticker, 0)
 
-    if time.time() - last_trade_time < COOLDOWN_TIME:
-      logger.info(f"⏳ {ticker} 쿨다운 중")
-      return
+    #if time.time() - last_trade_time < COOLDOWN_TIME:
+      #logger.info(f"⏳ {ticker} 쿨다운 중")
+      #return
 
     trade_result = None
 
@@ -132,16 +133,65 @@ def process_ticker(ticker, current_balance, available_krw):
       if volume >= get_min_trade_volume(f"KRW-{ticker}"):
         logger.info(f"🚀 {ticker} 매수 시도: {buy_price}원 × {volume}개")
         trade_result = buy_limit(f"KRW-{ticker}", buy_price, volume)
+
         if trade_result and "uuid" in trade_result:
           order_uuid = trade_result["uuid"]
           last_trade_times[ticker] = time.time()
 
           success, status = wait_for_limit_order(order_uuid, max_wait_time=10, interval=1)
+
+          if success:
+            new_avg_price = get_avg_buy_price(order_uuid)
+            new_volume = float(trade_result.get("volume", 0)) if "volume" in trade_result else invest_amount / buy_price
+
+            prev_qty = position.get(ticker, {}).get("balance", 0)
+            prev_avg = position.get(ticker, {}).get("avg_buy_price", 0)
+
+            updated_avg = calculate_new_avg_buy_price(prev_avg, prev_qty, new_avg_price, new_volume)
+
+            position[ticker] = {
+              "balance": prev_qty + new_volume,
+              "avg_buy_price": updated_avg
+            }
+
+            save_trade_status(
+                ticker,
+                buy_price=updated_avg,
+                partial_sell_count=0,
+                peak_price=new_avg_price  # 또는 latest_close
+            )
+
+            logger.info(f"📌 {ticker} 평단가 갱신: {updated_avg:.2f}원, 총 보유 수량: {prev_qty + new_volume:.6f}")
+
           if not success:
             logger.warning(f"⚠️ {ticker} 지정가 미체결 → 시장가 매수")
             cancel_order(order_uuid)
             time.sleep(1)
             trade_result = buy_market(f"KRW-{ticker}", invest_amount)
+
+            if trade_result and "uuid" in trade_result:
+              order_uuid = trade_result["uuid"]
+
+              new_avg_price = get_avg_buy_price(order_uuid)
+              new_volume = float(trade_result.get("volume", 0)) if "volume" in trade_result else invest_amount / buy_price
+
+              prev_qty = position.get(ticker, {}).get("balance", 0)
+              prev_avg = position.get(ticker, {}).get("avg_buy_price", 0)
+
+              updated_avg = calculate_new_avg_buy_price(prev_avg, prev_qty, new_avg_price, new_volume)
+
+              position[ticker] = {
+                "balance": prev_qty + new_volume,
+                "avg_buy_price": updated_avg
+              }
+
+              save_trade_status(
+                  ticker,
+                  buy_price=updated_avg,
+                  partial_sell_count=0,
+                  peak_price=new_avg_price  # 또는 latest_close
+              )
+              logger.info(f"📌 {ticker} 평단가 갱신: {updated_avg:.2f}원, 총 보유 수량: {prev_qty + new_volume:.6f}")
 
           log_trade_result(ticker, "buy", buy_price=buy_price, message=message)
 
@@ -169,7 +219,9 @@ def process_ticker(ticker, current_balance, available_krw):
             daily_profit = current_total - trading_context.total_start_balance
             profit_rate = (daily_profit / trading_context.total_start_balance) * 100
             trading_context.daily_profit = profit_rate
-            logger.info(f"💰 실현 수익: {daily_profit:,.0f}원 / 수익률: {profit_rate:.2f}% (현재 자산: {current_total:,.0f}원)")
+            logger.info(f"📊 평가 수익: {daily_profit:,.0f}원 / 수익률: {profit_rate:.2f}%")
+            logger.info(f"💼 현재 총 평가 자산: {current_total:,.0f}원 / 기준 자산: {trading_context.total_start_balance:,.0f}원")
+            logger.info(f"📈 누적 실현 수익: {trading_context.realized_profit:,.0f}원")
 
     if not trade_result or "uuid" not in trade_result:
       logger.warning(f"🚨 {ticker} 매매 실패")
@@ -199,7 +251,9 @@ def process_ticker(ticker, current_balance, available_krw):
                 daily_profit = current_total - trading_context.total_start_balance
                 profit_rate = (daily_profit / trading_context.total_start_balance) * 100
                 trading_context.daily_profit = profit_rate
-                logger.info(f"💰 실현 수익: {daily_profit:,.0f}원 / 수익률: {profit_rate:.2f}% (현재 자산: {current_total:,.0f}원)")
+                logger.info(f"📊 평가 수익: {daily_profit:,.0f}원 / 수익률: {profit_rate:.2f}%")
+                logger.info(f"💼 현재 총 평가 자산: {current_total:,.0f}원 / 기준 자산: {trading_context.total_start_balance:,.0f}원")
+                logger.info(f"📈 누적 실현 수익: {trading_context.realized_profit:,.0f}원")
 
     time.sleep(1)
 
