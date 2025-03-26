@@ -142,8 +142,11 @@ def process_ticker(ticker, current_balance, available_krw):
 
           if success:
             new_avg_price = get_avg_buy_price(order_uuid)
-            new_volume = float(trade_result.get("volume", 0)) if "volume" in trade_result else invest_amount / buy_price
+            if new_avg_price is None:
+              logger.warning(f"🚫 {ticker} 매수 체결 후 평균 매수가 확인 실패 → 현재가 사용")
+              new_avg_price = df_5m['close'].iloc[-1]  # 또는 latest_close
 
+            new_volume = float(trade_result.get("volume", 0)) if "volume" in trade_result else invest_amount / buy_price
             prev_qty = position.get(ticker, {}).get("balance", 0)
             prev_avg = position.get(ticker, {}).get("avg_buy_price", 0)
 
@@ -172,9 +175,34 @@ def process_ticker(ticker, current_balance, available_krw):
             if trade_result and "uuid" in trade_result:
               order_uuid = trade_result["uuid"]
 
+              # ❗ get_avg_buy_price 실패 대비
               new_avg_price = get_avg_buy_price(order_uuid)
-              new_volume = float(trade_result.get("volume", 0)) if "volume" in trade_result else invest_amount / buy_price
+              if new_avg_price is None:
+                logger.warning(f"🚫 {ticker} 시장가 매수 체결 후 평균 매수가 확인 실패 → 현재가 사용")
+                new_avg_price = df_5m['close'].iloc[-1]
 
+              # ✅ 잔고 기준 보정 적용
+              account_data = get_my_exchange_account()
+              asset_data = account_data["assets"].get(ticker)
+              if asset_data:
+                final_avg_price = float(asset_data["avg_buy_price"])
+                final_volume = float(asset_data["balance"])
+
+                position[ticker] = {
+                  "balance": final_volume,
+                  "avg_buy_price": final_avg_price
+                }
+
+                save_trade_status(
+                    ticker,
+                    buy_price=final_avg_price,
+                    partial_sell_count=0,
+                    peak_price=final_avg_price
+                )
+                logger.info(f"📌 [잔고 기준] {ticker} 평단가: {final_avg_price:.2f}원, 수량: {final_volume:.6f}")
+
+            else:
+              new_volume = float(trade_result.get("volume", 0)) if "volume" in trade_result else invest_amount / buy_price
               prev_qty = position.get(ticker, {}).get("balance", 0)
               prev_avg = position.get(ticker, {}).get("avg_buy_price", 0)
 
@@ -189,7 +217,7 @@ def process_ticker(ticker, current_balance, available_krw):
                   ticker,
                   buy_price=updated_avg,
                   partial_sell_count=0,
-                  peak_price=new_avg_price  # 또는 latest_close
+                  peak_price=new_avg_price
               )
               logger.info(f"📌 {ticker} 평단가 갱신: {updated_avg:.2f}원, 총 보유 수량: {prev_qty + new_volume:.6f}")
 
@@ -201,6 +229,24 @@ def process_ticker(ticker, current_balance, available_krw):
       if trade_result and "uuid" in trade_result:
         order_uuid = trade_result["uuid"]
         update_realized_profit(order_uuid, avg_buy_price)
+        original_qty = position.get(ticker, {}).get("balance", 0)
+        sell_ratio = result.get("sell_ratio", 0.5)
+        remaining_qty = original_qty * (1 - sell_ratio)
+        avg_price = position[ticker].get("avg_buy_price", avg_buy_price)
+
+        position[ticker] = {
+          "balance": remaining_qty,
+          "avg_buy_price": avg_price
+        }
+
+        save_trade_status(
+            ticker,
+            buy_price=avg_price,
+            partial_sell_count=trading_context.partial_sell_count.get(ticker, 0),
+            last_partial_sell_time=trading_context.last_partial_sell_time.get(ticker),
+            peak_price=trading_context.peak_price_since_buy.get(ticker, 0)
+        )
+
         time.sleep(0.5)
         status = get_order_status(order_uuid)
         trades = status.get("trades", [])
