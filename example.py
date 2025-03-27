@@ -11,7 +11,8 @@ from trading.trade import buy_limit, sell_market, get_orderbook_data, \
 from trading.trading_strategy import trading_strategy, trading_context, \
   update_realized_profit
 from account.my_account import get_my_exchange_account
-from settings import TRADE_TICKERS, MAX_TOTAL_INVEST, MAX_INVEST_AMOUNT, MIN_ORDER_AMOUNT
+from settings import TRADE_TICKERS, MAX_TOTAL_INVEST, MAX_INVEST_AMOUNT, \
+  MIN_ORDER_AMOUNT, MAX_INVEST_PER_TICKER_RATIO
 from db.strategy_logger import log_trade_result
 from utils.balance_util import get_total_balance, get_min_trade_volume
 
@@ -124,6 +125,15 @@ def process_ticker(ticker, current_balance, available_krw):
       invest_amount = get_investment_amount(available_krw, position, ticker)
       if invest_amount < MIN_ORDER_AMOUNT:
         logger.warning(f"⚠️ {ticker} 투자금 부족")
+        return
+
+      existing_qty = position.get(ticker, {}).get("balance", 0)
+      avg_price = position.get(ticker, {}).get("avg_buy_price", 0)
+      existing_investment = existing_qty * avg_price
+      MAX_INVEST_PER_TICKER = MAX_TOTAL_INVEST * MAX_INVEST_PER_TICKER_RATIO
+
+      if existing_investment + invest_amount > MAX_INVEST_PER_TICKER:
+        logger.warning(f"⛔ {ticker} 누적 투자금 {existing_investment + invest_amount:,.0f}원이 {MAX_INVEST_PER_TICKER:,.0f}원 초과 → 매수 차단")
         return
 
       buy_target_price = result.get("buy_target_price", df_5m['close'].iloc[-1])
