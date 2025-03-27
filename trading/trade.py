@@ -404,9 +404,14 @@ def calculate_stop_loss_take_profit(buy_price: float, atr: float, fee_rate: floa
     if atr is None or atr <= 0:
         atr = buy_price * 0.005  # 최소 ATR 기본값 적용
 
+    # ✅ 저가 코인 보정 (5000원 미만이면 더 넓은 손절폭)
+    atr_multiplier = 3
+    if buy_price < 5000:
+        atr_multiplier = 5
+
     # ✅ 변동성이 작으면 빠르게 손절·익절, 변동성이 크면 넓은 손절·익절 적용
-    stop_loss = max(buy_price - (atr * 3), min_stop_loss) * (1 - fee_rate)
-    take_profit = max(buy_price + (atr * 4), min_take_profit) * (1 - fee_rate)  # ✅ 익절폭 4배로 증가
+    stop_loss = max(buy_price - (atr * atr_multiplier), min_stop_loss) * (1 - fee_rate)
+    take_profit = max(buy_price + (atr * 4), min_take_profit) * (1 - fee_rate)
 
     # ✅ 수수료 적용
     stop_loss *= (1 - fee_rate * 2)  # 매수 & 매도 수수료 반영
