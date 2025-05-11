@@ -1,7 +1,7 @@
 # settings.py
 
 # 자동매매 대상 코인 목록
-TRADE_TICKERS = ['AVAX', 'PENDLE', 'SUI', 'XRP', 'SOL', 'ATOM']
+TRADE_TICKERS = ['AVAX', 'PENDLE', 'SUI', 'SOL', 'ATOM']
 
 # 매매 조건 설정
 MAX_TOTAL_INVEST = 1500000     # 전체 투자금 한도

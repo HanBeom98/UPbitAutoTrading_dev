@@ -29,3 +29,6 @@ class TradeStatus(Base):
     consecutive_losses = Column(Integer, default=0)  # 손절 횟수
     last_sell_time = Column(DateTime, nullable=True)  # 마지막 손절 시간
     peak_price = Column(Float, nullable=True)  # ✅ 최고가 저장 (트레일링 스탑용)
+
+    entry_reason = Column(String, nullable=True)  # 📌 매수 이유
+    sell_reason = Column(String, nullable=True)   # 📌 매도 이유

@@ -511,25 +511,36 @@ def calculate_new_avg_buy_price(prev_price, prev_qty, new_price, new_qty):
 
 def get_current_volume_ratio(ticker: str) -> float:
     """현재 보유량 비율 계산 (0~1)"""
-    balance_data = get_balance(ticker)
+    try:
+        balance_data = get_balance(ticker)
 
-    # 이 부분을 명확히 추가하여 balance_data가 숫자인 경우를 방어적으로 처리
-    if isinstance(balance_data, float):
-        balance_data = {'balance': balance_data, 'avg_buy_price': 0}
+        if not balance_data:
+            print(f"[WARN] {ticker}의 balance_data가 None입니다.")
+            return 0.0
 
-    total_amount = float(balance_data.get('balance', 0))
-    avg_buy_price = float(balance_data.get('avg_buy_price', 0))
+        if isinstance(balance_data, float):
+            balance_data = {'balance': balance_data, 'avg_buy_price': 0}
 
-    krw_balance_data = get_balance("KRW")
-    if isinstance(krw_balance_data, float):
-        krw_balance = krw_balance_data
-    else:
-        krw_balance = float(krw_balance_data.get('balance', 0))
+        total_amount = float(balance_data.get('balance', 0))
+        avg_buy_price = float(balance_data.get('avg_buy_price', 0))
 
-    total_valuation = total_amount * avg_buy_price
-    total_allocated = total_valuation + krw_balance
+        krw_balance_data = get_balance("KRW")
+        if isinstance(krw_balance_data, float):
+            krw_balance = krw_balance_data
+        elif krw_balance_data:
+            krw_balance = float(krw_balance_data.get('balance', 0))
+        else:
+            krw_balance = 0.0
 
-    return total_valuation / total_allocated if total_allocated > 0 else 0
+        total_valuation = total_amount * avg_buy_price
+        total_allocated = total_valuation + krw_balance
+
+        return total_valuation / total_allocated if total_allocated > 0 else 0
+
+    except Exception as e:
+        print(f"[ERROR] {ticker} get_current_volume_ratio 계산 실패: {e}")
+        return 0.0
+
 
 
 

@@ -9,7 +9,7 @@ from trading.trade import buy_limit, sell_market, get_orderbook_data, \
   get_avg_buy_price_from_balance, cancel_order, \
   buy_market, get_tick_size, wait_for_limit_order, get_order_status, calculate_new_avg_buy_price, get_avg_buy_price
 from trading.trading_strategy import trading_strategy, trading_context, \
-  update_realized_profit
+  update_realized_profit, initialize_context_for_ticker
 from account.my_account import get_my_exchange_account
 from settings import TRADE_TICKERS, MAX_TOTAL_INVEST, MAX_INVEST_AMOUNT, \
   MIN_ORDER_AMOUNT, MAX_INVEST_PER_TICKER_RATIO
@@ -31,18 +31,22 @@ formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
-# ✅ 수동 매수 자산 초기화
 account_data = get_my_exchange_account()
-if account_data and "assets" in account_data:
-  for ticker, asset in account_data["assets"].items():
-    if ticker in TRADE_TICKERS:
-      balance = float(asset.get("balance", 0))
-      avg_price = float(asset.get("avg_buy_price", 0))
-      if balance > 0:
-        position[ticker] = {"balance": balance, "avg_buy_price": avg_price}
-        #last_trade_times[ticker] = time.time() - COOLDOWN_TIME
-        highest_prices[ticker] = avg_price
 
+for ticker in TRADE_TICKERS:
+  initialize_context_for_ticker(ticker)
+
+  asset = account_data.get("assets", {}).get(ticker, {})
+  balance = float(asset.get("balance", 0))
+  avg_price = float(asset.get("avg_buy_price", 0))
+
+  if balance > 0:
+    position[ticker] = {
+      "balance": balance,
+      "avg_buy_price": avg_price
+    }
+    highest_prices[ticker] = avg_price  # 최고가도 평단으로 초기화
+    logger.info(f"✅ {ticker} 포지션 등록 완료 - 평단가: {avg_price:.2f}, 수량: {balance:.6f}")
 
 def get_investment_amount(available_krw, current_position, ticker):
   holding_tickers = sum(
@@ -61,11 +65,16 @@ def get_investment_amount(available_krw, current_position, ticker):
   invest_amount = total_invest_limit / len(TRADE_TICKERS)
   invest_amount = min(invest_amount, MAX_INVEST_AMOUNT)
 
+  if invest_amount < MIN_ORDER_AMOUNT:
+    logger.warning(f"⚠️ {ticker} 투자금 부족")
+    return 0
+
   logger.info(f"📊 {ticker} 투자 금액: {invest_amount}원")
   return invest_amount
 
 
 def process_ticker(ticker, current_balance, available_krw):
+  logger.info(f"[DEBUG] 티커 처리 시작: {ticker}")
   global position
 
   with ticker_lock:
@@ -107,6 +116,7 @@ def process_ticker(ticker, current_balance, available_krw):
     ) or {}
 
     signal = result.get("signal", "None")
+    logger.info(f"[DEBUG] {ticker} 전략 결과 → signal: {signal}, message: {result.get('message')}")
     if signal not in ["buy", "sell", "sell_partial"]:
       logger.info(f"📭 {ticker} 매매 시그널 없음")
       return
@@ -194,6 +204,7 @@ def process_ticker(ticker, current_balance, available_krw):
               # ✅ 잔고 기준 보정 적용
               account_data = get_my_exchange_account()
               asset_data = account_data["assets"].get(ticker)
+
               if asset_data:
                 final_avg_price = float(asset_data["avg_buy_price"])
                 final_volume = float(asset_data["balance"])
@@ -232,9 +243,21 @@ def process_ticker(ticker, current_balance, available_krw):
               logger.info(f"📌 {ticker} 평단가 갱신: {updated_avg:.2f}원, 총 보유 수량: {prev_qty + new_volume:.6f}")
 
           log_trade_result(ticker, "buy", buy_price=buy_price, message=message)
+        else:
+          logger.error(f"🚫 {ticker} 시장가 매수 실패 → 매수 포기")
+          return  # 실패이면 그 후는 지역하지 않음
 
     elif signal in ["sell_partial", "sell"]:
-      volume = position.get(ticker, {}).get("balance", 0) * (0.5 if signal == "sell_partial" else 1.0)
+      expected_volume = position.get(ticker, {}).get("balance", 0) * (0.5 if signal == "sell_partial" else 1.0)
+
+      account_data = get_my_exchange_account()
+      actual_balance = float(account_data["assets"].get(ticker, {}).get("balance", 0))
+      volume = expected_volume
+
+      if actual_balance < expected_volume:
+        logger.warning(f"🚫 {ticker} 매도 실패: 실제 보유량 부족 (보유량: {actual_balance}, 요청량: {expected_volume})")
+        return
+
       trade_result = sell_market(f"KRW-{ticker}", volume)
       if trade_result and "uuid" in trade_result:
         order_uuid = trade_result["uuid"]
@@ -289,6 +312,12 @@ def process_ticker(ticker, current_balance, available_krw):
           if result and "uuid" in result:
             order_uuid = result["uuid"]
             update_realized_profit(order_uuid, avg_buy_price)
+
+            position[ticker] = {
+              "balance": 0,
+              "avg_buy_price": 0
+            }
+
             time.sleep(0.5)
             status = get_order_status(order_uuid)
             trades = status.get("trades", [])
@@ -301,6 +330,16 @@ def process_ticker(ticker, current_balance, available_krw):
               else:
                 profit = None
               log_trade_result(ticker, "stop_loss", sell_price=avg_sell_price, profit_rate=profit, message="손절 실행")
+
+              save_trade_status(
+                  ticker,
+                  buy_price=0,
+                  partial_sell_count=0,
+                  peak_price=0,
+                  consecutive_losses=trading_context.consecutive_losses.get(ticker, 0),
+                  last_sell_time=trading_context.last_sell_time.get(ticker),
+                  sell_reason="손절 실행"
+              )
 
               current_total = get_total_balance()
               if trading_context.total_start_balance:
